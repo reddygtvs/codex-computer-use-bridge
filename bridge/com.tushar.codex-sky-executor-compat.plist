@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.tushar.codex-sky-executor-compat</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/launchctl</string>
+        <string>setenv</string>
+        <string>SWIFT_IS_CURRENT_EXECUTOR_LEGACY_MODE_OVERRIDE</string>
+        <string>legacy</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/tushar/Library/Logs/codex-sky-executor-compat.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/tushar/Library/Logs/codex-sky-executor-compat.log</string>
+</dict>
+</plist>

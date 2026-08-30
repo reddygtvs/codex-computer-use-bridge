@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "content", "name", "arguments_json"],
+  "properties": {
+    "kind": { "enum": ["message", "tool_call"] },
+    "content": { "type": "string" },
+    "name": { "type": "string" },
+    "arguments_json": { "type": "string" }
+  }
+}
