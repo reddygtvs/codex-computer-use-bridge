@@ -2061,6 +2061,94 @@ def _base_response(
     }
 
 
+def _message_output_item(
+    content: str,
+    phase: str,
+    message_id: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": message_id or ("msg_" + uuid.uuid4().hex),
+        "type": "message",
+        "status": "completed",
+        "role": "assistant",
+        "phase": phase,
+        "content": [
+            {
+                "type": "output_text",
+                "text": content,
+                "annotations": [],
+            }
+        ],
+    }
+
+
+def _message_output_events(
+    item: dict[str, Any],
+    response_id: str,
+    output_index: int,
+    already_streamed: bool,
+) -> list[dict[str, Any]]:
+    content = item["content"][0]
+    text = str(content["text"])
+    events: list[dict[str, Any]] = []
+    if not already_streamed:
+        events.extend([
+            {
+                "type": "response.output_item.added",
+                "response_id": response_id,
+                "output_index": output_index,
+                "item": {**item, "status": "in_progress", "content": []},
+            },
+            {
+                "type": "response.content_part.added",
+                "response_id": response_id,
+                "item_id": item["id"],
+                "output_index": output_index,
+                "content_index": 0,
+                "part": {
+                    "type": "output_text",
+                    "text": "",
+                    "annotations": [],
+                },
+            },
+            {
+                "type": "response.output_text.delta",
+                "response_id": response_id,
+                "item_id": item["id"],
+                "output_index": output_index,
+                "content_index": 0,
+                "delta": text,
+                "logprobs": [],
+            },
+        ])
+    events.extend([
+        {
+            "type": "response.output_text.done",
+            "response_id": response_id,
+            "item_id": item["id"],
+            "output_index": output_index,
+            "content_index": 0,
+            "text": text,
+            "logprobs": [],
+        },
+        {
+            "type": "response.content_part.done",
+            "response_id": response_id,
+            "item_id": item["id"],
+            "output_index": output_index,
+            "content_index": 0,
+            "part": content,
+        },
+        {
+            "type": "response.output_item.done",
+            "response_id": response_id,
+            "output_index": output_index,
+            "item": item,
+        },
+    ])
+    return events
+
+
 def _sse_events(
     proposal: dict[str, Any],
     usage: dict[str, int],
@@ -2068,6 +2156,7 @@ def _sse_events(
     include_created: bool = True,
     model: str = MODEL,
     streamed_message_id: str | None = None,
+    streamed_message_text: str = "",
 ) -> list[dict[str, Any]]:
     response_id = response_id or ("resp_" + uuid.uuid4().hex)
     if proposal.get("kind") in ("tool_call", "tool_calls"):
@@ -2080,7 +2169,23 @@ def _sse_events(
             raise ValueError("Gemini returned no tool calls")
         output: list[dict[str, Any]] = []
         events: list[dict[str, Any]] = []
-        for output_index, call in enumerate(calls):
+        first_tool_index = 0
+        if streamed_message_id is not None:
+            commentary = _message_output_item(
+                streamed_message_text,
+                "commentary",
+                streamed_message_id,
+            )
+            output.append(commentary)
+            events.extend(_message_output_events(
+                commentary,
+                response_id,
+                output_index=0,
+                already_streamed=True,
+            ))
+            first_tool_index = 1
+        for call_index, call in enumerate(calls):
+            output_index = first_tool_index + call_index
             if not isinstance(call, dict):
                 raise ValueError("Gemini returned an invalid tool call")
             name = str(call.get("wire_name") or call.get("name") or "")
@@ -2197,27 +2302,19 @@ def _sse_events(
         return events
 
     content = str(proposal.get("content") or "")
-    item = {
-        "id": streamed_message_id or ("msg_" + uuid.uuid4().hex),
-        "type": "message",
-        "status": "completed",
-        "role": "assistant",
-        "content": [{"type": "output_text", "text": content, "annotations": []}],
-    }
+    item = _message_output_item(
+        content,
+        "final_answer",
+        streamed_message_id,
+    )
     completed = _base_response(response_id, "completed", [item], usage, model)
-    events: list[dict[str, Any]] = []
-    if streamed_message_id is None:
-        events.extend([
-            {"type": "response.output_item.added", "response_id": response_id, "output_index": 0, "item": {**item, "status": "in_progress", "content": []}},
-            {"type": "response.content_part.added", "response_id": response_id, "item_id": item["id"], "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}},
-            {"type": "response.output_text.delta", "response_id": response_id, "item_id": item["id"], "output_index": 0, "content_index": 0, "delta": content, "logprobs": []},
-        ])
-    events.extend([
-        {"type": "response.output_text.done", "response_id": response_id, "item_id": item["id"], "output_index": 0, "content_index": 0, "text": content, "logprobs": []},
-        {"type": "response.content_part.done", "response_id": response_id, "item_id": item["id"], "output_index": 0, "content_index": 0, "part": item["content"][0]},
-        {"type": "response.output_item.done", "response_id": response_id, "output_index": 0, "item": item},
-        {"type": "response.completed", "response": completed},
-    ])
+    events = _message_output_events(
+        item,
+        response_id,
+        output_index=0,
+        already_streamed=streamed_message_id is not None,
+    )
+    events.append({"type": "response.completed", "response": completed})
     if include_created:
         events.insert(0, {"type": "response.created", "response": _base_response(response_id, "in_progress", [], usage, model)})
     return events
@@ -2351,11 +2448,10 @@ class Handler(BaseHTTPRequestHandler):
                 proposal, usage = worker.call(request, on_text_delta=stream_text)
             else:
                 proposal, usage = worker.call(request)
-            if streamed_message_id is not None:
-                if proposal.get("kind") != "message":
-                    raise ValueError(
-                        "Gemini streamed message text before a non-message result"
-                    )
+            if (
+                streamed_message_id is not None
+                and proposal.get("kind") == "message"
+            ):
                 final_text = str(proposal.get("content") or "")
                 if final_text.startswith(streamed_text):
                     stream_text(final_text[len(streamed_text):])
@@ -2373,6 +2469,7 @@ class Handler(BaseHTTPRequestHandler):
                 include_created=False,
                 model=model,
                 streamed_message_id=streamed_message_id,
+                streamed_message_text=streamed_text,
             ):
                 self._write_sse(event)
         except Exception as error:

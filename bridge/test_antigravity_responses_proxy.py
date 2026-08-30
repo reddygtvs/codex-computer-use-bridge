@@ -643,6 +643,7 @@ class NativeCodexProtocolTests(unittest.TestCase):
             {"kind": "message", "content": "Hello"},
             {},
             streamed_message_id="msg_streamed",
+            streamed_message_text="Hello",
         )
         event_types = [event["type"] for event in events]
         self.assertNotIn("response.output_text.delta", event_types)
@@ -650,6 +651,105 @@ class NativeCodexProtocolTests(unittest.TestCase):
             event for event in events if event["type"] == "response.output_text.done"
         )
         self.assertEqual(done["item_id"], "msg_streamed")
+        completed = next(
+            event for event in events if event["type"] == "response.completed"
+        )
+        self.assertEqual(
+            completed["response"]["output"][0]["phase"],
+            "final_answer",
+        )
+
+    @staticmethod
+    def tool_call(name: str, arguments: dict[str, object]) -> dict[str, object]:
+        return {
+            "kind": "tool_call",
+            "content": "",
+            "name": name,
+            "wire_name": name,
+            "arguments_json": json.dumps(arguments),
+            "tool_type": "function",
+            "namespace": None,
+        }
+
+    def test_streamed_commentary_precedes_one_tool_call(self) -> None:
+        events = proxy._sse_events(
+            self.tool_call("exec_command", {"cmd": "pwd"}),
+            {},
+            response_id="resp_test",
+            include_created=False,
+            streamed_message_id="msg_streamed",
+            streamed_message_text="I will inspect the workspace.",
+        )
+        completed_events = [
+            event for event in events if event["type"] == "response.completed"
+        ]
+        self.assertEqual(len(completed_events), 1)
+        output = completed_events[0]["response"]["output"]
+        self.assertEqual([item["type"] for item in output], ["message", "function_call"])
+        self.assertEqual(output[0]["phase"], "commentary")
+        self.assertEqual(output[0]["content"][0]["text"], "I will inspect the workspace.")
+        done_indices = [
+            event["output_index"]
+            for event in events
+            if event["type"] == "response.output_item.done"
+        ]
+        self.assertEqual(done_indices, [0, 1])
+
+    def test_streamed_commentary_precedes_parallel_tool_calls(self) -> None:
+        events = proxy._sse_events(
+            {
+                "kind": "tool_calls",
+                "calls": [
+                    self.tool_call("exec_command", {"cmd": "pwd"}),
+                    self.tool_call("list_threads", {"limit": 3}),
+                ],
+            },
+            {},
+            response_id="resp_test",
+            include_created=False,
+            streamed_message_id="msg_streamed",
+            streamed_message_text="I will inspect both sources.",
+        )
+        completed = next(
+            event for event in events if event["type"] == "response.completed"
+        )
+        output = completed["response"]["output"]
+        self.assertEqual(
+            [item["type"] for item in output],
+            ["message", "function_call", "function_call"],
+        )
+        self.assertEqual(output[0]["phase"], "commentary")
+        added_indices = [
+            event["output_index"]
+            for event in events
+            if event["type"] == "response.output_item.added"
+        ]
+        self.assertEqual(added_indices, [1, 2])
+
+    def test_tool_only_output_keeps_zero_index(self) -> None:
+        events = proxy._sse_events(
+            self.tool_call("exec_command", {"cmd": "pwd"}),
+            {},
+            response_id="resp_test",
+            include_created=False,
+        )
+        item_events = [
+            event
+            for event in events
+            if event["type"] in (
+                "response.output_item.added",
+                "response.output_item.done",
+            )
+        ]
+        self.assertTrue(item_events)
+        self.assertTrue(all(event["output_index"] == 0 for event in item_events))
+        completed = next(
+            event for event in events if event["type"] == "response.completed"
+        )
+        self.assertEqual(
+            [item["type"] for item in completed["response"]["output"]],
+            ["function_call"],
+        )
 
     def test_image_data_becomes_private_antigravity_attachment(self) -> None:
         payload = b"\x89PNG\r\n\x1a\nunit-test-image"
