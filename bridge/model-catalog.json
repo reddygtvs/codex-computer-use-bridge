@@ -50,50 +50,18 @@
       "multi_agent_version": null
     },
     {
-      "slug": "gpt-5.6-sol-instant",
-      "display_name": "GPT-5.6 Sol Instant",
-      "description": "OpenAI chat-latest API planner with native Codex tools and Computer Use.",
-      "base_instructions": "You are Codex using GPT-5.6 Sol Instant through the official prepaid OpenAI Responses API planner. Work with the user in the shared workspace. Use only the tools supplied by Codex. Follow all developer instructions, skills, permission rules, and confirmation requirements. Codex validates and executes native Computer Use actions. Continue until the user task is complete, then give a concise final answer.",
-      "default_reasoning_level": "low",
+      "clone_from": "gpt-5.6-sol",
+      "slug": "gpt-5.6-sol-none",
+      "display_name": "GPT-5.6 Sol None",
+      "default_reasoning_level": "none",
       "supported_reasoning_levels": [
         {
-          "effort": "low",
-          "description": "Fast GPT-5.6 Sol Instant planning"
+          "effort": "none",
+          "description": "No reasoning"
         }
       ],
-      "shell_type": "unified_exec",
-      "visibility": "list",
-      "supported_in_api": true,
       "priority": 2,
-      "additional_speed_tiers": [],
-      "service_tiers": [],
-      "availability_nux": null,
-      "upgrade": null,
-      "include_skills_usage_instructions": true,
-      "include_plugin_usage_instructions": true,
-      "include_apps_usage_instructions": true,
-      "default_reasoning_summary": "none",
-      "support_verbosity": false,
-      "default_verbosity": "low",
-      "apply_patch_tool_type": "freeform",
-      "web_search_tool_type": "text_and_image",
-      "truncation_policy": {
-        "mode": "tokens",
-        "limit": 10000
-      },
-      "supports_image_detail_original": true,
-      "context_window": 200000,
-      "max_context_window": 200000,
-      "comp_hash": "gpt-5.6-sol-instant-api-v1",
-      "effective_context_window_percent": 90,
-      "experimental_supported_tools": [],
-      "input_modalities": ["text", "image"],
-      "supports_search_tool": false,
-      "use_responses_lite": false,
-      "node_repl_auto_review_required": false,
-      "node_repl_disabled": false,
-      "tool_mode": null,
-      "multi_agent_version": null
+      "comp_hash": "gpt-5.6-sol-none-api-v1"
     },
     {
       "slug": "gpt-5.6-sol-fast",

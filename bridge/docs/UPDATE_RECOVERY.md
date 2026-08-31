@@ -1,7 +1,7 @@
 # Codex Update Recovery
 
 This directory is the canonical recovery package for the working full Codex
-Gemini adapter, ChatGPT Instant API, and GPT-5.6 Sol Low Fast API Computer Use
+Gemini adapter, GPT-5.6 Sol None API, and GPT-5.6 Sol Low Fast API Computer Use
 integrations.
 It contains no OpenAI API key, ChatGPT credential, Codex credential, or
 Antigravity session credential.
@@ -14,7 +14,6 @@ normally remove these user-owned files:
 
 - `~/.codex/config.toml`
 - `~/.codex/antigravity-router/`
-- `~/.codex/skills/computer-use-chatgpt-instant/`
 - the OpenAI API key in macOS Keychain service
   `computer-use-agnostic-openai-api-key`
 - `~/Library/LaunchAgents/com.tushar.codex-antigravity-router.plist`
@@ -47,7 +46,7 @@ The checks include the single-action and multi-action batch compiler, strict API
 schemas, direct API worker loop, Keychain entry, and all picker catalog entries.
 
 Restart Codex once after the command. Test **Gemini 3.7 Flash** with one mouse
-click. Then run the same test with **GPT-5.6 Sol Instant** and
+click. Then run the same test with **GPT-5.6 Sol None** and
 **GPT-5.6 Sol Low Fast**. Confirm that native PiP and the software cursor appear
 in all tasks.
 

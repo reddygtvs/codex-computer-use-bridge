@@ -13,7 +13,8 @@ from typing import Any
 
 DEFAULT_CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
 MODEL = "gemini-3.7-flash-low"
-CUSTOM_MODELS = {MODEL, "gpt-5.6-sol-instant", "gpt-5.6-sol-fast"}
+SOL_NONE_MODEL = "gpt-5.6-sol-none"
+CUSTOM_MODELS = {MODEL, SOL_NONE_MODEL, "gpt-5.6-sol-fast"}
 PROVIDER = "antigravity-router"
 
 
@@ -85,6 +86,7 @@ def main() -> int:
         },
     ]
     if args.set_default:
+        default_effort = "none" if default_model == SOL_NONE_MODEL else "low"
         edits[0:0] = [
             {
                 "keyPath": "model",
@@ -93,7 +95,7 @@ def main() -> int:
             },
             {
                 "keyPath": "model_reasoning_effort",
-                "value": "low",
+                "value": default_effort,
                 "mergeStrategy": "upsert",
             },
         ]

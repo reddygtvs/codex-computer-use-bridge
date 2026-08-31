@@ -15,7 +15,6 @@ codex_bin="/Applications/ChatGPT.app/Contents/Resources/codex"
 [[ -f "$config_file" ]]
 [[ -f "$router_dir/antigravity_responses_proxy.py" ]]
 [[ -f "$router_dir/merged-model-catalog.json" ]]
-[[ -f "$codex_home/skills/computer-use-chatgpt-instant/SKILL.md" ]]
 [[ -f "$router_plist" ]]
 [[ -f "$compat_plist" ]]
 
@@ -43,8 +42,9 @@ assert provider["wire_api"] == "responses"
 assert provider["requires_openai_auth"] is True
 catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
 assert any(model.get("slug") == "gemini-3.7-flash-low" for model in catalog["models"])
-assert any(model.get("slug") == "gpt-5.6-sol-instant" for model in catalog["models"])
+assert any(model.get("slug") == "gpt-5.6-sol-none" for model in catalog["models"])
 assert any(model.get("slug") == "gpt-5.6-sol-fast" for model in catalog["models"])
+assert not any(model.get("slug") == "gpt-5.6-sol-instant" for model in catalog["models"])
 print(json.dumps({"models": len(catalog["models"]), "provider": "antigravity-router"}))
 PY
 
@@ -61,4 +61,4 @@ codesign --verify --deep --strict "/Applications/ChatGPT.app"
 
 print "Codex: $($codex_bin -V)"
 print "Antigravity: $($HOME/.local/bin/agy --version 2>/dev/null | head -n 1)"
-print "Native Gemini, Instant API, and Sol Fast API persistence checks passed."
+print "Native Gemini, Sol None API, and Sol Fast API persistence checks passed."

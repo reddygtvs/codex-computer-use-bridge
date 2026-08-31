@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import antigravity_responses_proxy as proxy
+import build_model_catalog as catalog_builder
 
 
 class ComputerActionBatchTests(unittest.TestCase):
@@ -775,6 +776,47 @@ class NativeCodexProtocolTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
 
 
+class ModelCatalogTests(unittest.TestCase):
+    def test_sol_none_clones_stock_codex_model(self) -> None:
+        source = [{
+            "slug": "gpt-5.6-sol",
+            "display_name": "GPT-5.6 Sol",
+            "tool_mode": "code_mode_only",
+            "include_skills_usage_instructions": True,
+            "supported_reasoning_levels": [{"effort": "low"}],
+        }]
+        custom = [{
+            "clone_from": "gpt-5.6-sol",
+            "slug": "gpt-5.6-sol-none",
+            "display_name": "GPT-5.6 Sol None",
+            "default_reasoning_level": "none",
+            "supported_reasoning_levels": [{"effort": "none"}],
+        }]
+        expanded = catalog_builder.expand_custom_models(source, custom)
+        self.assertEqual(len(expanded), 1)
+        model = expanded[0]
+        self.assertEqual(model["slug"], "gpt-5.6-sol-none")
+        self.assertEqual(model["tool_mode"], "code_mode_only")
+        self.assertTrue(model["include_skills_usage_instructions"])
+        self.assertEqual(
+            model["supported_reasoning_levels"],
+            [{"effort": "none"}],
+        )
+        self.assertNotIn("clone_from", model)
+        self.assertEqual(source[0]["slug"], "gpt-5.6-sol")
+
+    def test_picker_catalog_replaces_instant_with_sol_none(self) -> None:
+        catalog = json.loads(
+            Path(proxy.__file__).with_name("model-catalog.json").read_text()
+        )
+        models = {model["slug"]: model for model in catalog["models"]}
+        self.assertIn(proxy.SOL_NONE_MODEL, models)
+        self.assertNotIn("gpt-5.6-sol-instant", models)
+        sol_none = models[proxy.SOL_NONE_MODEL]
+        self.assertEqual(sol_none["clone_from"], "gpt-5.6-sol")
+        self.assertEqual(sol_none["default_reasoning_level"], "none")
+
+
 class OpenAIAPIPlannerTests(unittest.TestCase):
     @staticmethod
     def output_item(call_id: str, text: str) -> dict[str, object]:
@@ -804,21 +846,39 @@ class OpenAIAPIPlannerTests(unittest.TestCase):
             },
         }
 
-    def test_instant_payload_uses_chat_latest_without_web_or_fast_tier(self) -> None:
-        payload = proxy._api_request_payload(
-            proxy.INSTANT_MODEL,
-            "USER TASK:\nOpen Calculator.",
+    def test_sol_none_keeps_stock_codex_request(self) -> None:
+        request = {
+            "model": proxy.SOL_NONE_MODEL,
+            "instructions": "Follow all Codex instructions.",
+            "input": [{"type": "message", "role": "user", "content": []}],
+            "tools": [{"type": "namespace", "name": "mcp__node_repl"}],
+            "tool_choice": "auto",
+            "parallel_tool_calls": True,
+            "reasoning": {"effort": "low", "summary": "none"},
+            "service_tier": "priority",
+            "stream": True,
+            "store": False,
+        }
+        payload = proxy._direct_api_request(proxy.SOL_NONE_MODEL, request)
+        self.assertEqual(payload["model"], "gpt-5.6-sol")
+        self.assertEqual(
+            payload["reasoning"],
+            {"effort": "none", "summary": "none"},
         )
-        self.assertEqual(payload["model"], "chat-latest")
-        self.assertNotIn("service_tier", payload)
-        self.assertNotIn("reasoning", payload)
-        self.assertEqual(payload["tool_choice"], "required")
-        self.assertFalse(payload["parallel_tool_calls"])
-        self.assertFalse(payload["store"])
-        serialized = json.dumps(payload).lower()
-        self.assertNotIn("chatgpt.com", serialized)
-        self.assertNotIn("browser_planner", serialized)
-        self.assertNotIn("instantbridge", serialized)
+        for name in (
+            "instructions",
+            "input",
+            "tools",
+            "tool_choice",
+            "parallel_tool_calls",
+            "service_tier",
+            "stream",
+            "store",
+        ):
+            self.assertEqual(payload[name], request[name])
+        self.assertEqual(request["model"], proxy.SOL_NONE_MODEL)
+        self.assertEqual(request["reasoning"]["effort"], "low")
+        self.assertNotIn("chat-latest", json.dumps(payload).lower())
 
     def test_sol_fast_payload_uses_low_reasoning_and_fast_tier(self) -> None:
         payload = proxy._api_request_payload(
@@ -949,7 +1009,7 @@ class OpenAIAPIPlannerTests(unittest.TestCase):
         self.assertEqual(normalized["content"], "Task complete.")
 
     def test_worker_calls_api_directly_and_keeps_native_state(self) -> None:
-        worker = proxy.OpenAIPlannerWorker("test-thread", proxy.INSTANT_MODEL)
+        worker = proxy.OpenAIPlannerWorker("test-thread", proxy.SOL_FAST_MODEL)
         user_item = {
             "type": "message",
             "role": "user",
@@ -992,7 +1052,7 @@ class OpenAIAPIPlannerTests(unittest.TestCase):
         self.assertIn("Calculator value: 12", second_prompt)
 
     def test_responses_report_both_api_picker_slugs(self) -> None:
-        for model in (proxy.INSTANT_MODEL, proxy.SOL_FAST_MODEL):
+        for model in (proxy.SOL_NONE_MODEL, proxy.SOL_FAST_MODEL):
             response = proxy._base_response(
                 "resp_test",
                 "completed",

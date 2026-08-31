@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Loopback Responses adapter for native Codex Computer Use planners.
+"""Loopback Responses adapter for native Codex model routes.
 
-Gemini uses the authenticated Antigravity CLI. OpenAI planner models use the
-official prepaid Responses API. Codex owns tools, permissions, and native UI.
+Gemini uses the authenticated Antigravity CLI. OpenAI models use the official
+prepaid Responses API. Codex owns tools, permissions, and native UI.
 """
 
 from __future__ import annotations
@@ -31,14 +31,20 @@ import uuid
 
 
 GEMINI_MODEL = "gemini-3.7-flash-low"
-INSTANT_MODEL = "gpt-5.6-sol-instant"
+SOL_NONE_MODEL = "gpt-5.6-sol-none"
 SOL_FAST_MODEL = "gpt-5.6-sol-fast"
 MODEL = GEMINI_MODEL
-CUSTOM_MODELS = (GEMINI_MODEL, INSTANT_MODEL, SOL_FAST_MODEL)
+CUSTOM_MODELS = (GEMINI_MODEL, SOL_NONE_MODEL, SOL_FAST_MODEL)
+API_DIRECT_MODELS = {
+    SOL_NONE_MODEL: {
+        "api_model": "gpt-5.6-sol",
+        "reasoning_effort": "none",
+    },
+}
 API_PLANNER_MODELS = {
-    INSTANT_MODEL: {"api_model": "chat-latest", "service_tier": None},
     SOL_FAST_MODEL: {"api_model": "gpt-5.6-sol", "service_tier": "fast"},
 }
+OPENAI_API_MODELS = set(API_DIRECT_MODELS) | set(API_PLANNER_MODELS)
 CODEX_SUBSCRIPTION_HOST = "chatgpt.com"
 CODEX_SUBSCRIPTION_PATH = "/backend-api/codex/responses"
 OPENAI_API_HOST = "api.openai.com"
@@ -590,6 +596,22 @@ def _api_request_payload(picker_model: str, prompt: str) -> dict[str, Any]:
         payload["reasoning"] = {"effort": "low"}
     if config["service_tier"]:
         payload["service_tier"] = config["service_tier"]
+    return payload
+
+
+def _direct_api_request(
+    picker_model: str,
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    config = API_DIRECT_MODELS.get(picker_model)
+    if config is None:
+        raise ValueError(f"No direct OpenAI API route is configured for {picker_model}")
+    payload = dict(request)
+    payload["model"] = config["api_model"]
+    current_reasoning = request.get("reasoning")
+    reasoning = dict(current_reasoning) if isinstance(current_reasoning, dict) else {}
+    reasoning["effort"] = config["reasoning_effort"]
+    payload["reasoning"] = reasoning
     return payload
 
 
@@ -1991,7 +2013,6 @@ class WorkerPool:
 
 
 WORKERS = WorkerPool()
-INSTANT_WORKERS = OpenAIPlannerPool(INSTANT_MODEL)
 SOL_FAST_WORKERS = OpenAIPlannerPool(SOL_FAST_MODEL)
 
 
@@ -2336,7 +2357,7 @@ class Handler(BaseHTTPRequestHandler):
                         "object": "model",
                         "owned_by": (
                             "openai-api"
-                            if model in API_PLANNER_MODELS
+                            if model in OPENAI_API_MODELS
                             else "antigravity"
                         ),
                     }
@@ -2359,8 +2380,8 @@ class Handler(BaseHTTPRequestHandler):
             if model == GEMINI_MODEL:
                 self._serve_custom(request, GEMINI_MODEL, WORKERS)
                 return
-            if model == INSTANT_MODEL:
-                self._serve_custom(request, INSTANT_MODEL, INSTANT_WORKERS)
+            if model in API_DIRECT_MODELS:
+                self._forward_api(request, model)
                 return
             if model == SOL_FAST_MODEL:
                 self._serve_custom(request, SOL_FAST_MODEL, SOL_FAST_WORKERS)
@@ -2538,6 +2559,62 @@ class Handler(BaseHTTPRequestHandler):
             headers.pop("Authorization", None)
             connection.close()
 
+    def _forward_api(
+        self,
+        request: dict[str, Any],
+        picker_model: str,
+    ) -> None:
+        payload = _direct_api_request(picker_model, request)
+        authorization = "Bearer " + _openai_api_key()
+        headers = {
+            "Authorization": authorization,
+            "Content-Type": "application/json",
+            "Accept": (
+                "text/event-stream"
+                if payload.get("stream") is True
+                else "application/json"
+            ),
+            "User-Agent": self.headers.get(
+                "User-Agent",
+                "codex-computer-use-bridge",
+            ),
+        }
+        tls = ssl.create_default_context(cafile=certifi.where())
+        connection = http.client.HTTPSConnection(
+            OPENAI_API_HOST,
+            timeout=180,
+            context=tls,
+        )
+        try:
+            connection.request(
+                "POST",
+                OPENAI_API_PATH,
+                body=_json(payload).encode(),
+                headers=headers,
+            )
+            upstream = connection.getresponse()
+            self.send_response(upstream.status)
+            self.send_header(
+                "Content-Type",
+                upstream.getheader(
+                    "Content-Type",
+                    headers["Accept"],
+                ),
+            )
+            if payload.get("stream") is True:
+                self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            while True:
+                chunk = upstream.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        finally:
+            authorization = ""
+            headers.pop("Authorization", None)
+            connection.close()
+
     def _send_json(self, status: int, payload: dict[str, Any]) -> None:
         body = _json(payload).encode()
         self.send_response(status)
@@ -2575,7 +2652,6 @@ def main() -> int:
         pass
     finally:
         WORKERS.close()
-        INSTANT_WORKERS.close()
         SOL_FAST_WORKERS.close()
         server.server_close()
     return 0

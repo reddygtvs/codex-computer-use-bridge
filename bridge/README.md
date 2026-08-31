@@ -1,9 +1,9 @@
 # Codex Computer Use Bridge
 
-This integration adds `Gemini 3.7 Flash`, `GPT-5.6 Sol Instant`, and
+This integration adds `Gemini 3.7 Flash`, `GPT-5.6 Sol None`, and
 `GPT-5.6 Sol Low Fast` to the Codex model catalog. Gemini requests use the
-authenticated Antigravity CLI. The two GPT planners use the official prepaid
-OpenAI Responses API. Existing OpenAI models continue through the ChatGPT Codex
+authenticated Antigravity CLI. The GPT routes use the official prepaid OpenAI
+Responses API. Existing OpenAI models continue through the ChatGPT Codex
 subscription endpoint.
 
 Codex continues to own task history, native tool cards, permissions,
@@ -35,11 +35,12 @@ The legacy personal `computer-use-gemini` skill is not part of this path. The
 router loads the newest bundled Codex Computer Use skill directly. The small
 router contract defines only the structured output format and action allowlist.
 
-For both GPT API models, the router sends a compact task and state history to
-the official Responses API. The API must return one strict action function or
-one final-message function. The same allowlist validator and Sky compiler used
-for Gemini then produces the native Codex tool call. No browser planner,
-ChatGPT cookie, Codex OAuth token, or private ChatGPT backend is used.
+For `GPT-5.6 Sol None`, the router forwards the complete stock Codex Responses
+request and stream. It changes only the API model ID and reasoning effort. The
+model receives the normal Codex instructions, skills, tools, state, images, and
+response controls. `GPT-5.6 Sol Low Fast` keeps the strict compact Computer Use
+planner. No browser planner, ChatGPT cookie, Codex OAuth token, or private
+ChatGPT backend is used.
 
 The login LaunchAgent sets Swift's supported legacy executor mode in the macOS
 GUI launch domain. ChatGPT starts each native Sky service from this domain, so
@@ -51,13 +52,12 @@ signature, or Computer Use tool path.
 Installed files:
 
 - `~/.codex/antigravity-router/`
-- `~/.codex/skills/computer-use-chatgpt-instant/SKILL.md`
 - `~/Library/LaunchAgents/com.tushar.codex-antigravity-router.plist`
 - `~/Library/LaunchAgents/com.tushar.codex-sky-executor-compat.plist`
 - Provider and catalog entries in `~/.codex/config.toml`
 
 After installation, start a new task and select **Gemini 3.7 Flash** or
-**GPT-5.6 Sol Instant** or **GPT-5.6 Sol Low Fast** from the normal model
+**GPT-5.6 Sol None** or **GPT-5.6 Sol Low Fast** from the normal model
 picker. Restart Codex only if the picker does not refresh. The GPT entries
 require the prepaid API key in the Keychain service
 `computer-use-agnostic-openai-api-key`.
@@ -76,11 +76,11 @@ fetch current state.
 
 ## GPT API status
 
-`GPT-5.6 Sol Instant` maps to `chat-latest`. `GPT-5.6 Sol Low Fast` maps to
-`gpt-5.6-sol` with low reasoning and `service_tier: fast`. Both use strict
-function calls and the current bundled Computer Use skill. The adapter stops
-with a clear error when the key is missing, API credit is unavailable, or a
-response fails validation. It never changes to another model silently.
+`GPT-5.6 Sol None` maps to `gpt-5.6-sol` with reasoning effort `none` and the
+stock Codex Responses contract. `GPT-5.6 Sol Low Fast` maps to `gpt-5.6-sol`
+with low reasoning and `service_tier: fast`. The adapter stops with a clear
+error when the key is missing, API credit is unavailable, or a response fails.
+It never changes to another model silently.
 
 This repository is the canonical recovery copy. After a Codex update, run
 `repair-after-codex-update.sh`, restart Codex once, and run one direct pointer

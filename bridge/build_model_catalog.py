@@ -10,6 +10,33 @@ from pathlib import Path
 import tempfile
 
 
+def expand_custom_models(
+    source_models: list[dict[str, object]],
+    custom_models: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    source_by_slug = {
+        model.get("slug"): model
+        for model in source_models
+        if isinstance(model.get("slug"), str)
+    }
+    expanded: list[dict[str, object]] = []
+    for custom in custom_models:
+        clone_from = custom.get("clone_from")
+        if clone_from is None:
+            expanded.append(dict(custom))
+            continue
+        base = source_by_slug.get(clone_from)
+        if base is None:
+            raise RuntimeError(f"Base model was not found: {clone_from}")
+        overrides = {
+            key: value
+            for key, value in custom.items()
+            if key != "clone_from"
+        }
+        expanded.append({**base, **overrides})
+    return expanded
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -30,15 +57,17 @@ def main() -> int:
     args = parser.parse_args()
 
     source = json.loads(args.source.read_text())
-    custom_models = json.loads(args.gemini.read_text()).get("models", [])
-    if not custom_models:
+    custom_specs = json.loads(args.gemini.read_text()).get("models", [])
+    if not custom_specs:
         raise RuntimeError("Custom model catalog did not contain any models")
+    source_models = source.get("models", [])
+    custom_models = expand_custom_models(source_models, custom_specs)
     custom_slugs = {model.get("slug") for model in custom_models}
     models = [
         *custom_models,
         *[
             model
-            for model in source.get("models", [])
+            for model in source_models
             if model.get("slug") not in custom_slugs
         ],
     ]

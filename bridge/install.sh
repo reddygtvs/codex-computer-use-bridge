@@ -5,8 +5,7 @@ script_dir="${0:A:h}"
 codex_home="${CODEX_HOME:-$HOME/.codex}"
 router_dir="$codex_home/antigravity-router"
 config_file="$codex_home/config.toml"
-instant_skill_source="$script_dir/skills/computer-use-chatgpt-instant"
-instant_skill_dir="$codex_home/skills/computer-use-chatgpt-instant"
+obsolete_instant_skill_dir="$codex_home/skills/computer-use-chatgpt-instant"
 launch_agents_dir="$HOME/Library/LaunchAgents"
 router_plist="$launch_agents_dir/com.tushar.codex-antigravity-router.plist"
 compat_plist="$launch_agents_dir/com.tushar.codex-sky-executor-compat.plist"
@@ -45,8 +44,9 @@ done
 install -m 755 "$script_dir/antigravity_responses_proxy.py" "$router_dir/antigravity_responses_proxy.py"
 install -m 755 "$script_dir/build_model_catalog.py" "$router_dir/build_model_catalog.py"
 
-install -d -m 700 "$instant_skill_dir"
-install -m 600 "$instant_skill_source/SKILL.md" "$instant_skill_dir/SKILL.md"
+if [[ -d "$obsolete_instant_skill_dir" ]]; then
+  /bin/rm -R "$obsolete_instant_skill_dir"
+fi
 
 /usr/bin/env python3 "$router_dir/build_model_catalog.py" \
   --source "$codex_home/models_cache.json" \

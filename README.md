@@ -5,7 +5,7 @@ Local model routing for native Codex Computer Use on macOS.
 Supported picker entries:
 
 - Gemini 3.7 Flash through Antigravity
-- GPT-5.6 Sol Instant through the OpenAI API
+- GPT-5.6 Sol None through the OpenAI API
 - GPT-5.6 Sol Fast through the OpenAI API
 
 Codex keeps control of task history, permissions, tool cards, Sky execution,
