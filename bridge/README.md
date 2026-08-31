@@ -20,7 +20,9 @@ Codex supplies the skill catalog in its normal instructions. Gemini reads the
 complete selected `SKILL.md` through a Codex tool only when the task triggers
 that skill. Deferred connector schemas use the same pattern: Gemini first asks
 the router for the exact schema, then emits the real Codex tool call. Core tool
-schemas stay exact from the first turn.
+schemas stay exact when the complete prompt fits. The router removes duplicate
+descriptions and limits each Gemini prompt to 180,000 UTF-8 bytes. When needed,
+it defers the largest exact schemas while it keeps the active task unchanged.
 
 The router loads the installed native Computer Use skill once for each Gemini
 planner session. This protected preload preserves the previously verified

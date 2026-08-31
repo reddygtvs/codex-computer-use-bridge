@@ -265,6 +265,427 @@ class NativeCodexProtocolTests(unittest.TestCase):
             "computer_action",
         )
 
+    def test_exact_tool_description_is_serialized_once_without_data_loss(self) -> None:
+        description = "UNIQUE EXACT TOOL DESCRIPTION"
+        tool = {
+            "type": "namespace",
+            "name": "mcp__codex_app",
+            "tools": [{
+                "type": "function",
+                "name": "example",
+                "description": description,
+                "parameters": {"type": "object", "properties": {}},
+            }],
+        }
+        original = json.loads(json.dumps(tool))
+        manifest, specs, _ = proxy._flatten_tool_catalog([tool])
+        entry = json.loads(manifest)["callable_tools"][0]
+        self.assertEqual(manifest.count(description), 1)
+        self.assertNotIn("description", {
+            key: value for key, value in entry.items() if key != "definition"
+        })
+        self.assertEqual(entry["definition"]["description"], description)
+        self.assertEqual(
+            specs["mcp__codex_app__example"]["definition"]["description"],
+            description,
+        )
+        self.assertEqual(tool, original)
+
+    def test_prompt_budget_defers_exact_schema_and_preserves_active_task(self) -> None:
+        def child(name: str, marker: str) -> dict[str, object]:
+            return {
+                "type": "function",
+                "name": name,
+                "description": f"Use {name}.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {
+                            "type": "string",
+                            "description": marker * 6000,
+                        },
+                    },
+                    "required": ["payload"],
+                },
+            }
+
+        tools = [{
+            "type": "namespace",
+            "name": "mcp__codex_app",
+            "tools": [child("tool_a", "A"), child("tool_b", "B")],
+        }]
+        request = {
+            "instructions": "Follow the task.",
+            "tools": tools,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+        }
+        delta = "USER:\nACTIVE_USER_TASK_SENTINEL\nLATEST_TOOL_RESULT_SENTINEL"
+        with mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"):
+            manifest, _, _ = proxy._flatten_tool_catalog(tools)
+            unbounded = proxy._gemini_prompt(
+                request,
+                delta,
+                manifest,
+                include_contract=True,
+                include_instructions=True,
+                include_tools=True,
+            )
+            maximum = len(unbounded) - 1000
+            packed = proxy._pack_gemini_prompt(
+                request,
+                delta,
+                include_contract=True,
+                include_instructions=True,
+                include_tools=True,
+                maximum_bytes=maximum,
+            )
+        prompt, packed_manifest, specs, _, deferred = packed
+        name = "mcp__codex_app__tool_a"
+        self.assertLessEqual(proxy._utf8_size(prompt), maximum)
+        self.assertTrue(prompt.endswith(delta))
+        self.assertEqual(prompt.count("ACTIVE_USER_TASK_SENTINEL"), 1)
+        self.assertEqual(prompt.count("LATEST_TOOL_RESULT_SENTINEL"), 1)
+        self.assertEqual(deferred, {name})
+        entries = {
+            entry["canonical_name"]: entry
+            for entry in json.loads(packed_manifest)["callable_tools"]
+        }
+        self.assertEqual(set(entries), {
+            "mcp__codex_app__tool_a",
+            "mcp__codex_app__tool_b",
+        })
+        self.assertEqual(entries[name]["schema_mode"], "inspect_before_call")
+        self.assertNotIn("definition", entries[name])
+        proposal = {
+            "kind": "tool_call",
+            "content": "",
+            "name": name,
+            "arguments_json": '{"payload":"value"}',
+        }
+        with self.assertRaisesRegex(ValueError, "inspect_tools"):
+            proxy._normalize_proposal(proposal, specs)
+        inspected: set[str] = set()
+        inspection = proxy._tool_inspection_prompt(
+            {
+                "kind": "tool_call",
+                "name": "inspect_tools",
+                "arguments_json": json.dumps({"names": [name]}),
+            },
+            specs,
+            inspected,
+        )
+        self.assertIn("A" * 100, inspection)
+        normalized = proxy._normalize_proposal(
+            proposal,
+            specs,
+            inspected_tools=inspected,
+        )
+        self.assertEqual(normalized["name"], name)
+
+    def test_tool_change_recomputes_budget_deferred_modes(self) -> None:
+        def tools(schema_padding: int) -> list[dict[str, object]]:
+            return [{
+                "type": "namespace",
+                "name": "mcp__codex_app",
+                "tools": [{
+                    "type": "function",
+                    "name": "large_tool",
+                    "description": "Use the tool.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "value": {
+                                "type": "string",
+                                "description": "X" * schema_padding,
+                            },
+                        },
+                    },
+                }],
+            }]
+
+        first_request = {
+            "instructions": "Rules.",
+            "tools": tools(8000),
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "First."}],
+            }],
+        }
+        with mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"):
+            manifest, _, _ = proxy._flatten_tool_catalog(first_request["tools"])
+            unbounded = proxy._gemini_prompt(
+                first_request,
+                "USER:\nFirst.",
+                manifest,
+                include_contract=True,
+                include_instructions=True,
+                include_tools=True,
+            )
+            maximum = len(unbounded) - 1000
+            worker = proxy.AgyWorker("budget-mode-test")
+            process = mock.Mock()
+            process.poll.return_value = None
+            worker.process = process
+            worker._turn = mock.Mock(side_effect=[
+                ({
+                    "kind": "message",
+                    "content": "First done.",
+                    "name": "",
+                    "arguments_json": "{}",
+                }, {}),
+                ({
+                    "kind": "message",
+                    "content": "Second done.",
+                    "name": "",
+                    "arguments_json": "{}",
+                }, {}),
+            ])
+            with mock.patch.object(proxy, "MAX_GEMINI_PROMPT_BYTES", maximum):
+                worker.call(first_request)
+                self.assertEqual(
+                    worker.deferred_tool_names,
+                    {"mcp__codex_app__large_tool"},
+                )
+                second_user = {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Second."}],
+                }
+                worker.call({
+                    **first_request,
+                    "tools": tools(10),
+                    "input": [first_request["input"][0], second_user],
+                })
+        self.assertEqual(worker.deferred_tool_names, set())
+        second_prompt = worker._turn.call_args_list[1].args[0]
+        self.assertIn("EXTERNAL TOOL CATALOG", second_prompt)
+
+    def test_unfit_protected_prompt_fails_before_planner_turn(self) -> None:
+        worker = proxy.AgyWorker("budget-failure-test")
+        process = mock.Mock()
+        process.poll.return_value = None
+        worker.process = process
+        worker._turn = mock.Mock()
+        request = {
+            "instructions": "Rules.",
+            "tools": self.tools(),
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "ACTIVE_TASK"}],
+            }],
+        }
+        with (
+            mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"),
+            mock.patch.object(proxy, "MAX_GEMINI_PROMPT_BYTES", 500),
+        ):
+            with self.assertRaisesRegex(proxy.PromptBudgetError, "safe limit"):
+                worker.call(request)
+        worker._turn.assert_not_called()
+        self.assertFalse(worker.seeded)
+        self.assertEqual(worker.seen, set())
+
+    def test_turn_rejects_oversized_schema_before_stdin_write(self) -> None:
+        worker = proxy.AgyWorker("turn-budget-test")
+        process = mock.Mock()
+        process.poll.return_value = None
+        worker.process = process
+        with mock.patch.object(proxy, "MAX_GEMINI_PROMPT_BYTES", 10):
+            with self.assertRaisesRegex(proxy.PromptBudgetError, "safe limit"):
+                worker._turn("X" * 11)
+        process.stdin.write.assert_not_called()
+
+    def test_prompt_budget_counts_utf8_bytes(self) -> None:
+        request = {"instructions": "é" * 100}
+        with mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"):
+            prompt = proxy._gemini_prompt(
+                request,
+                "USER:\nTask.",
+                "{}",
+                include_contract=False,
+                include_instructions=True,
+                include_tools=False,
+            )
+            with self.assertRaisesRegex(proxy.PromptBudgetError, "bytes"):
+                proxy._pack_gemini_prompt(
+                    request,
+                    "USER:\nTask.",
+                    include_contract=False,
+                    include_instructions=True,
+                    include_tools=False,
+                    maximum_bytes=len(prompt),
+                )
+
+    def test_prompt_budget_can_cross_one_time_lazy_catalog_overhead(self) -> None:
+        def child(name: str) -> dict[str, object]:
+            return {
+                "type": "function",
+                "name": name,
+                "description": "D",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "type": "string",
+                            "description": "X" * 10,
+                        },
+                    },
+                },
+            }
+
+        tools = [{
+            "type": "namespace",
+            "name": "mcp__codex_app",
+            "tools": [child(f"tool_{letter}") for letter in "abcd"],
+        }]
+        request = {"instructions": "I", "tools": tools}
+        delta = "USER:\nT"
+        first = {"mcp__codex_app__tool_a"}
+        first_two = first | {"mcp__codex_app__tool_b"}
+        with mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"):
+            base_manifest, _, _ = proxy._flatten_tool_catalog(tools)
+            one_manifest, _, _ = proxy._flatten_tool_catalog(
+                tools,
+                deferred_tools=first,
+            )
+            two_manifest, _, _ = proxy._flatten_tool_catalog(
+                tools,
+                deferred_tools=first_two,
+            )
+            prompts = [
+                proxy._gemini_prompt(
+                    request,
+                    delta,
+                    manifest,
+                    include_contract=True,
+                    include_instructions=True,
+                    include_tools=True,
+                )
+                for manifest in (base_manifest, one_manifest, two_manifest)
+            ]
+            base_bytes, one_bytes, two_bytes = map(proxy._utf8_size, prompts)
+            self.assertGreater(one_bytes, base_bytes)
+            self.assertLess(two_bytes, base_bytes)
+            packed = proxy._pack_gemini_prompt(
+                request,
+                delta,
+                include_contract=True,
+                include_instructions=True,
+                include_tools=True,
+                maximum_bytes=two_bytes,
+            )
+        prompt, _, _, _, deferred = packed
+        self.assertLessEqual(proxy._utf8_size(prompt), two_bytes)
+        self.assertEqual(deferred, first_two)
+
+    def test_turn_does_not_silently_start_an_unseeded_process(self) -> None:
+        worker = proxy.AgyWorker("dead-process-test")
+        process = mock.Mock()
+        process.poll.return_value = 1
+        worker.process = process
+        worker._start = mock.Mock()
+        with self.assertRaisesRegex(proxy.AgyProcessError, "unavailable"):
+            worker._turn("warm delta")
+        worker._start.assert_not_called()
+
+    def test_process_restart_forgets_prior_schema_inspection(self) -> None:
+        large_tool = {
+            "type": "namespace",
+            "name": "mcp__codex_app",
+            "tools": [{
+                "type": "function",
+                "name": "large_tool",
+                "description": "Use the tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "value": {
+                            "type": "string",
+                            "description": "X" * 8000,
+                        },
+                    },
+                    "required": ["value"],
+                },
+            }],
+        }
+        request = {
+            "instructions": "Rules.",
+            "tools": [large_tool],
+            "input": [{
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Run it."}],
+            }],
+        }
+        with mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"):
+            manifest, _, _ = proxy._flatten_tool_catalog(request["tools"])
+            unbounded = proxy._gemini_prompt(
+                request,
+                "USER:\nRun it.",
+                manifest,
+                include_contract=True,
+                include_instructions=True,
+                include_tools=True,
+            )
+        maximum = len(unbounded) - 1000
+        worker = proxy.AgyWorker("restart-inspection-test")
+        live_process = mock.Mock()
+        live_process.poll.return_value = None
+        worker.process = live_process
+        direct_call = {
+            "kind": "tool_call",
+            "content": "",
+            "name": "mcp__codex_app__large_tool",
+            "arguments_json": '{"value":"ok"}',
+        }
+
+        def turn(prompt: str, *_: object) -> tuple[dict[str, str], dict[str, int]]:
+            call_number = worker._turn.call_count
+            if call_number == 1:
+                return ({
+                    "kind": "tool_call",
+                    "content": "",
+                    "name": "inspect_tools",
+                    "arguments_json": json.dumps({
+                        "names": ["mcp__codex_app__large_tool"],
+                    }),
+                }, {})
+            if call_number == 2:
+                dead_process = mock.Mock()
+                dead_process.poll.return_value = 1
+                worker.process = dead_process
+                raise RuntimeError("planner process closed")
+            if call_number == 3:
+                return direct_call, {}
+            return ({
+                "kind": "message",
+                "content": "Recovered.",
+                "name": "",
+                "arguments_json": "{}",
+            }, {})
+
+        def restart() -> None:
+            replacement = mock.Mock()
+            replacement.poll.return_value = None
+            worker.process = replacement
+
+        worker._turn = mock.Mock(side_effect=turn)
+        worker._start = mock.Mock(side_effect=restart)
+        with (
+            mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"),
+            mock.patch.object(proxy, "MAX_GEMINI_PROMPT_BYTES", maximum),
+        ):
+            proposal, _ = worker.call(request)
+        self.assertEqual(proposal["content"], "Recovered.")
+        self.assertEqual(worker._turn.call_count, 4)
+        restart_prompt = worker._turn.call_args_list[2].args[0]
+        self.assertIn("CODEX_RESPONSES_ADAPTER_REQUEST_V2", restart_prompt)
+        self.assertIn("Run it.", restart_prompt)
+        repair_prompt = worker._turn.call_args_list[3].args[0]
+        self.assertIn("REPAIR_RESPONSE_V2", repair_prompt)
+
     def test_general_function_call_is_validated_and_preserved(self) -> None:
         _, specs, _ = self.catalog()
         normalized = proxy._normalize_proposal(

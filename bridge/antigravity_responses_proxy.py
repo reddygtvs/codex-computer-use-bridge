@@ -73,8 +73,19 @@ MAX_CUSTOM_TOOL_INPUT_CHARS = 400_000
 MAX_PARALLEL_TOOL_CALLS = 8
 MAX_TOOL_DESCRIPTION_CHARS = 1800
 MAX_TOOL_INSPECTIONS = 3
+MAX_GEMINI_PROMPT_BYTES = 180_000
 MAX_IMAGE_ATTACHMENTS = 8
 MAX_IMAGE_ATTACHMENT_BYTES = 25_000_000
+
+ALWAYS_EAGER_TOOL_NAMES = frozenset({"mcp__node_repl__js"})
+
+
+class PromptBudgetError(Exception):
+    """A complete Antigravity turn cannot fit without losing protected data."""
+
+
+class AgyProcessError(RuntimeError):
+    """The persistent Antigravity process must be restarted and reseeded."""
 
 IMAGE_MIME_EXTENSIONS = {
     "image/png": ".png",
@@ -134,6 +145,10 @@ KEY_ALIASES = {
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _utf8_size(value: str) -> int:
+    return len(value.encode("utf-8"))
 
 
 def _content_text(content: Any) -> str:
@@ -838,12 +853,33 @@ def _flatten_tool_catalog(
     tools: Any,
     tool_choice: Any = "auto",
     parallel_tool_calls: bool = False,
+    deferred_tools: set[str] | None = None,
 ) -> tuple[str, dict[str, dict[str, Any]], str]:
     """Return the prompt manifest, canonical call map, and stable signature."""
     source = tools if isinstance(tools, list) else []
+    forced_deferred = set(deferred_tools or set())
     specs: dict[str, dict[str, Any]] = {}
     manifest_tools: list[dict[str, Any]] = []
+    stable_signature_tools: list[dict[str, Any]] = []
     unsupported: list[dict[str, str]] = []
+
+    def add_lazy_shape(target: dict[str, Any], tool: dict[str, Any]) -> None:
+        parameters = tool.get("parameters")
+        if isinstance(parameters, dict):
+            properties = parameters.get("properties")
+            target["argument_names"] = (
+                sorted(str(name) for name in properties)
+                if isinstance(properties, dict)
+                else []
+            )
+            required = parameters.get("required")
+            target["required_argument_names"] = (
+                required if isinstance(required, list) else []
+            )
+        tool_format = tool.get("format")
+        if isinstance(tool_format, dict):
+            target["format_type"] = tool_format.get("type")
+            target["format_syntax"] = tool_format.get("syntax")
 
     def register(tool: dict[str, Any], namespace: str | None = None) -> None:
         tool_type = tool.get("type")
@@ -855,7 +891,7 @@ def _flatten_tool_catalog(
             return
         wire_name = _tool_name(tool.get("name"))
         canonical = f"{namespace}__{wire_name}" if namespace else wire_name
-        eager = (
+        default_eager = (
             namespace is None
             or namespace in {
                 "mcp__codex_app",
@@ -866,6 +902,7 @@ def _flatten_tool_catalog(
                 "image_gen",
             }
         )
+        eager = default_eager and canonical not in forced_deferred
         spec = {
             "canonical_name": canonical,
             "tool_type": tool_type,
@@ -878,6 +915,7 @@ def _flatten_tool_catalog(
         if prior is not None and prior != spec:
             raise ValueError(f"Codex request contains conflicting tool {canonical}")
         specs[canonical] = spec
+
         description = tool.get("description")
         if isinstance(description, str) and len(description) > MAX_TOOL_DESCRIPTION_CHARS:
             description = description[:MAX_TOOL_DESCRIPTION_CHARS] + " [truncated]"
@@ -885,29 +923,28 @@ def _flatten_tool_catalog(
             "canonical_name": canonical,
             "call_kind": tool_type,
             "namespace": namespace,
-            "description": description or "",
             "schema_mode": "exact" if eager else "inspect_before_call",
         }
         if eager:
+            # The exact definition already contains its description. Keeping a
+            # second outer copy wastes first-turn context without adding data.
             entry["definition"] = tool
         else:
-            parameters = tool.get("parameters")
-            if isinstance(parameters, dict):
-                properties = parameters.get("properties")
-                entry["argument_names"] = (
-                    sorted(str(name) for name in properties)
-                    if isinstance(properties, dict)
-                    else []
-                )
-                required = parameters.get("required")
-                entry["required_argument_names"] = (
-                    required if isinstance(required, list) else []
-                )
-            tool_format = tool.get("format")
-            if isinstance(tool_format, dict):
-                entry["format_type"] = tool_format.get("type")
-                entry["format_syntax"] = tool_format.get("syntax")
+            entry["description"] = description or ""
+            add_lazy_shape(entry, tool)
         manifest_tools.append(entry)
+
+        signature_entry: dict[str, Any] = {
+            "canonical_name": canonical,
+            "call_kind": tool_type,
+            "namespace": namespace,
+            "schema_mode": "exact" if default_eager else "inspect_before_call",
+        }
+        if default_eager:
+            signature_entry["definition"] = tool
+        else:
+            add_lazy_shape(signature_entry, tool)
+        stable_signature_tools.append(signature_entry)
 
     for tool in source:
         if not isinstance(tool, dict):
@@ -955,24 +992,6 @@ def _flatten_tool_catalog(
         raise ValueError(
             f"Codex tool catalog exceeds {MAX_TOOL_CATALOG_CHARS} characters"
         )
-    stable_signature_tools: list[dict[str, Any]] = []
-    for entry in manifest_tools:
-        if entry["schema_mode"] == "exact":
-            stable_signature_tools.append(entry)
-        else:
-            stable_signature_tools.append({
-                key: entry.get(key)
-                for key in (
-                    "canonical_name",
-                    "call_kind",
-                    "namespace",
-                    "schema_mode",
-                    "argument_names",
-                    "required_argument_names",
-                    "format_type",
-                    "format_syntax",
-                )
-            })
     signature_source = _json({
         "tools": stable_signature_tools,
         "unsupported": unsupported,
@@ -1489,6 +1508,90 @@ def _gemini_prompt(
     return "\n\n".join(sections)
 
 
+def _pack_gemini_prompt(
+    request: dict[str, Any],
+    delta: str,
+    include_contract: bool,
+    include_instructions: bool,
+    include_tools: bool,
+    deferred_tools: set[str] | None = None,
+    maximum_bytes: int | None = None,
+) -> tuple[
+    str,
+    str,
+    dict[str, dict[str, Any]],
+    str,
+    set[str],
+]:
+    """Build one complete prompt without shortening protected task state."""
+    maximum = (
+        MAX_GEMINI_PROMPT_BYTES
+        if maximum_bytes is None
+        else maximum_bytes
+    )
+    if maximum <= 0:
+        raise ValueError("Gemini prompt limit must be positive")
+    deferred = set(deferred_tools or set())
+
+    def build(
+        selected_deferred: set[str],
+    ) -> tuple[str, str, dict[str, dict[str, Any]], str]:
+        manifest, specs, signature = _flatten_tool_catalog(
+            request.get("tools"),
+            request.get("tool_choice", "auto"),
+            bool(request.get("parallel_tool_calls", False)),
+            selected_deferred,
+        )
+        prompt = _gemini_prompt(
+            request,
+            delta,
+            manifest,
+            include_contract=include_contract,
+            include_instructions=include_instructions,
+            include_tools=include_tools,
+        )
+        return prompt, manifest, specs, signature
+
+    prompt, manifest, specs, signature = build(deferred)
+    prompt_bytes = _utf8_size(prompt)
+    while prompt_bytes > maximum:
+        if not include_tools:
+            raise PromptBudgetError(
+                f"Gemini protected prompt requires {prompt_bytes} bytes; "
+                f"safe limit is {maximum}"
+            )
+        candidates = sorted(
+            (
+                (-_utf8_size(_json(spec["definition"])), name)
+                for name, spec in specs.items()
+                if spec.get("schema_mode") == "exact"
+                and name not in ALWAYS_EAGER_TOOL_NAMES
+            ),
+            key=lambda item: (item[0], item[1]),
+        )
+        deferred_one = False
+        for _, name in candidates:
+            next_deferred = deferred | {name}
+            next_prompt, next_manifest, next_specs, next_signature = build(
+                next_deferred
+            )
+            next_prompt_bytes = _utf8_size(next_prompt)
+            deferred = next_deferred
+            prompt = next_prompt
+            prompt_bytes = next_prompt_bytes
+            manifest = next_manifest
+            specs = next_specs
+            signature = next_signature
+            deferred_one = True
+            break
+        if not deferred_one:
+            raise PromptBudgetError(
+                f"Gemini protected prompt and compact tool catalog require "
+                f"{prompt_bytes} bytes; safe limit is {maximum}"
+            )
+    return prompt, manifest, specs, signature, deferred
+
+
 def _repair_prompt(error: str, tool_specs: dict[str, dict[str, Any]]) -> str:
     available = sorted(tool_specs)
     if "mcp__node_repl__js" in tool_specs:
@@ -1568,6 +1671,7 @@ class AgyWorker:
         self.instructions_signature: str | None = None
         self.tool_signature: str | None = None
         self.tool_definition_hashes: dict[str, str] = {}
+        self.deferred_tool_names: set[str] = set()
         self.attachment_dir = Path(tempfile.mkdtemp(
             prefix="codex-gemini-images-"
         ))
@@ -1598,6 +1702,7 @@ class AgyWorker:
         self.instructions_signature = None
         self.tool_signature = None
         self.tool_definition_hashes = {}
+        self.deferred_tool_names = set()
         command = [
             str(AGY), "--model", MODEL, "--effort", "low", "--sandbox",
             "--add-dir", str(self.attachment_dir),
@@ -1641,10 +1746,15 @@ class AgyWorker:
         prompt: str,
         on_text_delta: Callable[[str], None] | None = None,
     ) -> tuple[dict[str, Any], dict[str, int]]:
+        prompt_bytes = _utf8_size(prompt)
+        if prompt_bytes > MAX_GEMINI_PROMPT_BYTES:
+            raise PromptBudgetError(
+                f"Gemini prompt requires {prompt_bytes} bytes; safe limit "
+                f"is {MAX_GEMINI_PROMPT_BYTES}"
+            )
         process = self.process
         if process is None or process.poll() is not None:
-            self._start()
-            process = self.process
+            raise AgyProcessError("Antigravity planner process is unavailable")
         assert process is not None and process.stdin is not None
         process.stdin.write(_json({"event": "user", "message": {"content": prompt}}) + "\n")
         process.stdin.flush()
@@ -1664,7 +1774,7 @@ class AgyWorker:
                 self._stop_process()
                 raise TimeoutError("Antigravity planner timed out") from error
             if event is None:
-                raise RuntimeError("Antigravity planner process closed")
+                raise AgyProcessError("Antigravity planner process closed")
             if event.get("event") == "step_update":
                 step_update = event.get("step_update") or {}
                 step_usage = step_update.get("usage") or {}
@@ -1727,13 +1837,49 @@ class AgyWorker:
         with self.lock:
             if self.process is None or self.process.poll() is not None:
                 self._start()
-            tool_manifest, tool_specs, tool_signature = _flatten_tool_catalog(
+            _, _, incoming_tool_signature = _flatten_tool_catalog(
                 request.get("tools"),
                 request.get("tool_choice", "auto"),
                 bool(request.get("parallel_tool_calls", False)),
+                self.deferred_tool_names,
             )
             instructions = _request_instructions(request)
             instructions_signature = hashlib.sha256(instructions.encode()).hexdigest()
+            prepared_input = _prepare_gemini_input(
+                request.get("input"),
+                self.attachment_dir,
+            )
+            delta, fingerprints = _serialize_delta(prepared_input, self.seen)
+            if not delta:
+                delta = "Continue the latest pending task from the newest known state."
+            include_contract = not self.seeded
+            include_instructions = (
+                not self.seeded
+                or instructions_signature != self.instructions_signature
+            )
+            include_tools = (
+                not self.seeded
+                or incoming_tool_signature != self.tool_signature
+            )
+            starting_deferred = (
+                set()
+                if include_tools and incoming_tool_signature != self.tool_signature
+                else self.deferred_tool_names
+            )
+            (
+                prompt,
+                tool_manifest,
+                tool_specs,
+                tool_signature,
+                packed_deferred_tools,
+            ) = _pack_gemini_prompt(
+                request,
+                delta,
+                include_contract=include_contract,
+                include_instructions=include_instructions,
+                include_tools=include_tools,
+                deferred_tools=starting_deferred,
+            )
             tool_definition_hashes = {
                 name: hashlib.sha256(_json(spec["definition"]).encode()).hexdigest()
                 for name, spec in tool_specs.items()
@@ -1744,37 +1890,19 @@ class AgyWorker:
                 if tool_definition_hashes.get(name)
                 != self.tool_definition_hashes.get(name)
             )
-            prepared_input = _prepare_gemini_input(
-                request.get("input"),
-                self.attachment_dir,
-            )
-            delta, fingerprints = _serialize_delta(prepared_input, self.seen)
-            if not delta:
-                delta = "Continue the latest pending task from the newest known state."
-            prompt = _gemini_prompt(
-                request,
-                delta,
-                tool_manifest,
-                include_contract=not self.seeded,
-                include_instructions=(
-                    not self.seeded
-                    or instructions_signature != self.instructions_signature
-                ),
-                include_tools=(
-                    not self.seeded or tool_signature != self.tool_signature
-                ),
-            )
             if DEBUG_TOOLS:
                 print(_json({
                     "event": "gemini_prompt_debug",
                     "session": self.key[:12],
                     "prompt_chars": len(prompt),
+                    "prompt_bytes": _utf8_size(prompt),
                     "delta_chars": len(delta),
                     "delta_tail": delta[-1200:],
                     "instructions_chars": len(instructions),
                     "tool_manifest_chars": len(tool_manifest),
                     "tool_names": sorted(tool_specs),
                     "changed_tool_names": changed_tool_names,
+                    "budget_deferred_tools": sorted(packed_deferred_tools),
                 }), file=sys.stderr, flush=True)
             started = time.monotonic()
             last_error = "invalid planner result"
@@ -1817,6 +1945,7 @@ class AgyWorker:
                     self.instructions_signature = instructions_signature
                     self.tool_signature = tool_signature
                     self.tool_definition_hashes = tool_definition_hashes
+                    self.deferred_tool_names = set(packed_deferred_tools)
                     self.last_used = time.monotonic()
                     print(_json({
                         "event": "gemini_turn",
@@ -1835,16 +1964,28 @@ class AgyWorker:
                         "attempt": attempt + 1,
                         "error": last_error[:1000],
                     }), file=sys.stderr, flush=True)
-                    if self.process is None or self.process.poll() is not None:
+                    process = self.process
+                    restart_required = isinstance(
+                        error,
+                        (AgyProcessError, TimeoutError, BrokenPipeError),
+                    ) or process is None or process.poll() is not None
+                    if restart_required:
                         self._start()
+                        inspected_tools.clear()
                         full_state = _serialize_input(prepared_input)
-                        next_prompt = _gemini_prompt(
+                        (
+                            next_prompt,
+                            tool_manifest,
+                            tool_specs,
+                            tool_signature,
+                            packed_deferred_tools,
+                        ) = _pack_gemini_prompt(
                             request,
                             full_state,
-                            tool_manifest,
                             include_contract=True,
                             include_instructions=True,
                             include_tools=True,
+                            deferred_tools=set(),
                         )
                     else:
                         next_prompt = _repair_prompt(last_error, tool_specs)
