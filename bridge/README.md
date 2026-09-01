@@ -28,7 +28,12 @@ The router loads the installed native Computer Use skill once for each Gemini
 planner session. This protected preload preserves the previously verified
 Computer Use path while other skills remain lazy. The router keeps the
 Antigravity `stream-json` process alive and sends only new conversation items
-on later steps. Gemini chooses one action or an ordered action batch using the
+on later steps. It records Antigravity's native conversation ID for each hashed
+Codex task key. A replacement worker resumes that conversation with
+`--conversation` and receives only the newest Codex delta. If the native
+conversation is unavailable, the router starts a bounded recovery checkpoint
+that keeps the active user text and newest native state exact. It never replays
+an unlimited task history. Gemini chooses one action or an ordered action batch using the
 same native skill judgment as an OpenAI model. The router validates every
 action before it compiles the batch into one exact Sky call. It reads fresh
 state after the batch. Gemini cannot supply arbitrary JavaScript.

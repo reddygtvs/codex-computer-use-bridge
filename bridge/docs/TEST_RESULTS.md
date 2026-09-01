@@ -2,6 +2,21 @@
 
 Test date: 2026-08-29
 
+## Native Antigravity resume limit fix
+
+Test date: 2026-08-31
+
+The router now captures the `conversation_id` from the Antigravity
+`stream-json` initialization event. Worker restarts and pool eviction resume
+the same native conversation and send only the newest Codex delta. A missing
+conversation uses a bounded checkpoint with exact active user text and newest
+native state.
+
+The local regression suite passed 67 tests. The added tests cover process
+resume, pool eviction, a long Codex history, invalid conversation IDs,
+instruction and tool changes, and exact recovery text. A live no-turn CLI
+smoke test created and resumed the same Antigravity conversation ID.
+
 ## Initial adapter smoke tests
 
 | Check | Result | Wall time |

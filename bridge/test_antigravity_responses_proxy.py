@@ -445,7 +445,7 @@ class NativeCodexProtocolTests(unittest.TestCase):
             with mock.patch.object(proxy, "MAX_GEMINI_PROMPT_BYTES", maximum):
                 worker.call(first_request)
                 self.assertEqual(
-                    worker.deferred_tool_names,
+                    worker.state.deferred_tool_names,
                     {"mcp__codex_app__large_tool"},
                 )
                 second_user = {
@@ -458,7 +458,7 @@ class NativeCodexProtocolTests(unittest.TestCase):
                     "tools": tools(10),
                     "input": [first_request["input"][0], second_user],
                 })
-        self.assertEqual(worker.deferred_tool_names, set())
+        self.assertEqual(worker.state.deferred_tool_names, set())
         second_prompt = worker._turn.call_args_list[1].args[0]
         self.assertIn("EXTERNAL TOOL CATALOG", second_prompt)
 
@@ -484,8 +484,8 @@ class NativeCodexProtocolTests(unittest.TestCase):
             with self.assertRaisesRegex(proxy.PromptBudgetError, "safe limit"):
                 worker.call(request)
         worker._turn.assert_not_called()
-        self.assertFalse(worker.seeded)
-        self.assertEqual(worker.seen, set())
+        self.assertFalse(worker.state.seeded)
+        self.assertEqual(worker.state.seen, set())
 
     def test_turn_rejects_oversized_schema_before_stdin_write(self) -> None:
         worker = proxy.AgyWorker("turn-budget-test")
@@ -631,6 +631,7 @@ class NativeCodexProtocolTests(unittest.TestCase):
             )
         maximum = len(unbounded) - 1000
         worker = proxy.AgyWorker("restart-inspection-test")
+        worker.state.conversation_id = "25e80b2e-8c0f-453b-95e4-bee5f5d222a2"
         live_process = mock.Mock()
         live_process.poll.return_value = None
         worker.process = live_process
@@ -666,10 +667,11 @@ class NativeCodexProtocolTests(unittest.TestCase):
                 "arguments_json": "{}",
             }, {})
 
-        def restart() -> None:
+        def restart() -> bool:
             replacement = mock.Mock()
             replacement.poll.return_value = None
             worker.process = replacement
+            return True
 
         worker._turn = mock.Mock(side_effect=turn)
         worker._start = mock.Mock(side_effect=restart)
@@ -1195,6 +1197,207 @@ class NativeCodexProtocolTests(unittest.TestCase):
             path = Path(text.splitlines()[0][1:])
             self.assertEqual(path.read_bytes(), payload)
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+
+class AntigravityConversationLifecycleTests(unittest.TestCase):
+    CONVERSATION_ID = "25e80b2e-8c0f-453b-95e4-bee5f5d222a2"
+
+    @staticmethod
+    def request(items: list[dict[str, object]]) -> dict[str, object]:
+        return {
+            "instructions": "Follow the current Codex rules.",
+            "tools": [],
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "input": items,
+        }
+
+    @staticmethod
+    def message(text: str, role: str = "user") -> dict[str, object]:
+        return {
+            "type": "message",
+            "role": role,
+            "content": [{"type": "input_text", "text": text}],
+        }
+
+    def test_start_records_and_reuses_native_conversation_id(self) -> None:
+        worker = proxy.AgyWorker("native-resume-start")
+        processes = [mock.Mock(), mock.Mock()]
+        for process in processes:
+            process.poll.return_value = None
+        reader = mock.Mock()
+        with (
+            mock.patch.object(
+                proxy.subprocess,
+                "Popen",
+                side_effect=processes,
+            ) as popen,
+            mock.patch.object(
+                worker,
+                "_await_init",
+                side_effect=[self.CONVERSATION_ID, self.CONVERSATION_ID],
+            ),
+            mock.patch.object(proxy.threading, "Thread", return_value=reader),
+        ):
+            self.assertFalse(worker._start(resume=False))
+            self.assertEqual(worker.state.conversation_id, self.CONVERSATION_ID)
+            self.assertTrue(worker._start())
+        second_command = popen.call_args_list[1].args[0]
+        self.assertIn("--conversation", second_command)
+        conversation_at = second_command.index("--conversation")
+        self.assertEqual(
+            second_command[conversation_at + 1],
+            self.CONVERSATION_ID,
+        )
+
+    def test_init_rejects_invalid_or_changed_conversation_id(self) -> None:
+        with self.assertRaisesRegex(proxy.AgyProcessError, "invalid"):
+            proxy.AgyWorker._conversation_id_from_init({
+                "event": "init",
+                "conversation_id": "not-a-conversation",
+            })
+
+    def test_pool_eviction_keeps_native_session_mapping(self) -> None:
+        pool = proxy.WorkerPool()
+        try:
+            first = pool.get("thread-one")
+            first.state.conversation_id = self.CONVERSATION_ID
+            first.state.seeded = True
+            first.state.seen.add("known-item")
+            first.state.last_used = 0
+            with mock.patch.object(first, "close") as close:
+                pool.get("thread-two")
+                close.assert_called_once()
+            replacement = pool.get("thread-one")
+            self.assertIsNot(replacement, first)
+            self.assertIs(replacement.state, first.state)
+            self.assertEqual(
+                replacement.state.conversation_id,
+                self.CONVERSATION_ID,
+            )
+            self.assertEqual(replacement.state.seen, {"known-item"})
+        finally:
+            pool.close()
+
+    def test_long_thread_resume_sends_only_latest_delta(self) -> None:
+        old_items = [
+            self.message(f"OLD_MARKER_{index:03d}_" + "X" * 2000, "assistant")
+            for index in range(120)
+        ]
+        active = self.message("LATEST USER TEXT é\nDo the next exact step.")
+        request = self.request([*old_items, active])
+        state = proxy.AgySessionState("long-native-resume")
+        state.conversation_id = self.CONVERSATION_ID
+        state.seeded = True
+        state.seen.update(proxy._item_fingerprint(item) for item in old_items)
+        instructions = proxy._request_instructions(request)
+        state.instructions_signature = proxy.hashlib.sha256(
+            instructions.encode()
+        ).hexdigest()
+        _, _, state.tool_signature = proxy._flatten_tool_catalog([])
+        worker = proxy.AgyWorker("long-native-resume", state)
+        worker._start = mock.Mock(return_value=True)
+        worker._turn = mock.Mock(return_value=(
+            {
+                "kind": "message",
+                "content": "Continued.",
+                "name": "",
+                "arguments_json": "{}",
+            },
+            {},
+        ))
+        with mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"):
+            result, _ = worker.call(request)
+        self.assertEqual(result["content"], "Continued.")
+        prompt = worker._turn.call_args.args[0]
+        self.assertIn("LATEST USER TEXT é\nDo the next exact step.", prompt)
+        self.assertNotIn("OLD_MARKER_000", prompt)
+        self.assertNotIn("CODEX_RESPONSES_ADAPTER_REQUEST_V2", prompt)
+        self.assertLess(proxy._utf8_size(prompt), 5_000)
+
+    def test_failed_resume_uses_bounded_exact_checkpoint(self) -> None:
+        old_items = [
+            self.message(f"OLD_MARKER_{index:03d}_" + "X" * 1800, "assistant")
+            for index in range(180)
+        ]
+        active_text = "ACTIVE USER TEXT é\nKeep this exact: {\"value\":7}"
+        active = self.message(active_text)
+        newest = {
+            "type": "function_call_output",
+            "call_id": "call_latest",
+            "output": "NEWEST NATIVE STATE: button 42 is visible",
+        }
+        request = self.request([*old_items, active, newest])
+        state = proxy.AgySessionState("failed-native-resume")
+        state.conversation_id = self.CONVERSATION_ID
+        state.seeded = True
+        worker = proxy.AgyWorker("failed-native-resume", state)
+
+        def start(resume: bool | None = None) -> bool:
+            if resume is None:
+                raise proxy.AgyResumeError("missing native conversation")
+            state.reset_conversation()
+            state.conversation_id = "40cfa0bf-6fcf-4b96-bd16-e150078b6ad2"
+            return False
+
+        worker._start = mock.Mock(side_effect=start)
+        worker._turn = mock.Mock(return_value=(
+            {
+                "kind": "message",
+                "content": "Recovered.",
+                "name": "",
+                "arguments_json": "{}",
+            },
+            {},
+        ))
+        with mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"):
+            result, _ = worker.call(request)
+        self.assertEqual(result["content"], "Recovered.")
+        prompt = worker._turn.call_args.args[0]
+        self.assertIn("BOUNDED CODEX RECOVERY CHECKPOINT", prompt)
+        self.assertIn(active_text, prompt)
+        self.assertIn("NEWEST NATIVE STATE: button 42 is visible", prompt)
+        self.assertNotIn("OLD_MARKER_000", prompt)
+        self.assertLessEqual(
+            proxy._utf8_size(prompt),
+            proxy.MAX_GEMINI_PROMPT_BYTES,
+        )
+        self.assertEqual(
+            worker._start.call_args_list[1],
+            mock.call(resume=False),
+        )
+
+    def test_resume_sends_changed_instructions_and_tools(self) -> None:
+        request = self.request([self.message("Use the updated rules.")])
+        request["tools"] = [{
+            "type": "function",
+            "name": "updated_tool",
+            "description": "Use the updated tool.",
+            "parameters": {"type": "object", "properties": {}},
+        }]
+        state = proxy.AgySessionState("resume-sync")
+        state.conversation_id = self.CONVERSATION_ID
+        state.seeded = True
+        state.instructions_signature = "old"
+        state.tool_signature = "old"
+        worker = proxy.AgyWorker("resume-sync", state)
+        worker._start = mock.Mock(return_value=True)
+        worker._turn = mock.Mock(return_value=(
+            {
+                "kind": "message",
+                "content": "Updated.",
+                "name": "",
+                "arguments_json": "{}",
+            },
+            {},
+        ))
+        with mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"):
+            worker.call(request)
+        prompt = worker._turn.call_args.args[0]
+        self.assertIn("CODEX DEVELOPER INSTRUCTIONS", prompt)
+        self.assertIn("Follow the current Codex rules.", prompt)
+        self.assertIn("EXTERNAL TOOL CATALOG", prompt)
+        self.assertIn("updated_tool", prompt)
 
 
 class ModelCatalogTests(unittest.TestCase):

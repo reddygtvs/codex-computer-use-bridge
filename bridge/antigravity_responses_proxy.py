@@ -11,6 +11,7 @@ import argparse
 import base64
 import binascii
 import certifi
+from dataclasses import dataclass, field
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
@@ -60,6 +61,7 @@ COMPUTER_USE_SKILL_ROOT = (
 DEBUG_TOOLS = False
 WORKER_IDLE_SECONDS = 15 * 60
 MAX_WORKERS = 8
+MAX_AGY_SESSION_STATES = 256
 MAX_COMPUTER_ACTIONS = 64
 MAX_INSTANT_PROMPT_CHARS = 20000
 MAX_INSTANT_STATE_CHARS = 8000
@@ -74,6 +76,8 @@ MAX_PARALLEL_TOOL_CALLS = 8
 MAX_TOOL_DESCRIPTION_CHARS = 1800
 MAX_TOOL_INSPECTIONS = 3
 MAX_GEMINI_PROMPT_BYTES = 180_000
+MAX_GEMINI_RECOVERY_DELTA_BYTES = 48_000
+AGY_INIT_TIMEOUT_SECONDS = 20
 MAX_IMAGE_ATTACHMENTS = 8
 MAX_IMAGE_ATTACHMENT_BYTES = 25_000_000
 
@@ -86,6 +90,40 @@ class PromptBudgetError(Exception):
 
 class AgyProcessError(RuntimeError):
     """The persistent Antigravity process must be restarted and reseeded."""
+
+
+class AgyResumeError(AgyProcessError):
+    """Antigravity could not resume the requested native conversation."""
+
+
+@dataclass
+class AgySessionState:
+    """Conversation data that survives worker process and pool eviction."""
+
+    key: str
+    conversation_id: str | None = None
+    seen: set[str] = field(default_factory=set)
+    seeded: bool = False
+    instructions_signature: str | None = None
+    tool_signature: str | None = None
+    tool_definition_hashes: dict[str, str] = field(default_factory=dict)
+    deferred_tool_names: set[str] = field(default_factory=set)
+    attachment_dir: Path = field(default_factory=lambda: Path(tempfile.mkdtemp(
+        prefix="codex-gemini-images-"
+    )))
+    last_used: float = field(default_factory=time.monotonic)
+
+    def reset_conversation(self) -> None:
+        self.conversation_id = None
+        self.seen.clear()
+        self.seeded = False
+        self.instructions_signature = None
+        self.tool_signature = None
+        self.tool_definition_hashes = {}
+        self.deferred_tool_names = set()
+
+    def dispose(self) -> None:
+        shutil.rmtree(self.attachment_dir, ignore_errors=True)
 
 IMAGE_MIME_EXTENSIONS = {
     "image/png": ".png",
@@ -843,6 +881,78 @@ def _serialize_delta(items: Any, seen: set[str]) -> tuple[str, set[str]]:
     return _serialize_input(fresh), fingerprints
 
 
+def _bounded_recovery_delta(
+    items: Any,
+    maximum_bytes: int = MAX_GEMINI_RECOVERY_DELTA_BYTES,
+) -> str:
+    """Keep the active user text and newest state in a bounded reseed."""
+    if maximum_bytes <= 0:
+        raise ValueError("Gemini recovery limit must be positive")
+    if not isinstance(items, list):
+        serialized = _serialize_input(items)
+        return (
+            "BOUNDED CODEX RECOVERY CHECKPOINT:\n"
+            "The native Antigravity conversation was unavailable. Continue "
+            "from this exact supplied state.\n\n"
+            + serialized
+        )
+
+    relevant = [
+        (index, item)
+        for index, item in enumerate(items)
+        if not (isinstance(item, dict) and item.get("type") == "reasoning")
+    ]
+    if not relevant:
+        return (
+            "BOUNDED CODEX RECOVERY CHECKPOINT:\n"
+            "No prior Codex state was available. Continue the pending task."
+        )
+
+    blocks = {
+        index: _serialize_input([item])
+        for index, item in relevant
+    }
+    latest_index = relevant[-1][0]
+    latest_user_index = next(
+        (
+            index
+            for index, item in reversed(relevant)
+            if isinstance(item, dict)
+            and item.get("type") == "message"
+            and item.get("role") == "user"
+        ),
+        None,
+    )
+    chosen = {latest_index}
+    if latest_user_index is not None:
+        chosen.add(latest_user_index)
+
+    notice = (
+        "BOUNDED CODEX RECOVERY CHECKPOINT:\n"
+        "The native Antigravity conversation was unavailable. Some older "
+        "Codex items were omitted. The newest USER text and newest state "
+        "below are exact. Continue the active task."
+    )
+    selected_bytes = sum(_utf8_size(blocks[index]) for index in chosen)
+    total_bytes = (
+        _utf8_size(notice)
+        + 2
+        + selected_bytes
+        + max(0, len(chosen) - 1) * 2
+    )
+
+    for index, _ in reversed(relevant):
+        if index in chosen:
+            continue
+        block_bytes = _utf8_size(blocks[index])
+        separator_bytes = 2 if chosen else 0
+        if total_bytes + separator_bytes + block_bytes <= maximum_bytes:
+            chosen.add(index)
+            total_bytes += separator_bytes + block_bytes
+    body = "\n\n".join(blocks[index] for index in sorted(chosen))
+    return notice + "\n\n" + body
+
+
 def _tool_name(value: Any, label: str = "tool name") -> str:
     if not isinstance(value, str) or not value or len(value) > 512:
         raise ValueError(f"Codex request contains an invalid {label}")
@@ -1592,6 +1702,47 @@ def _pack_gemini_prompt(
     return prompt, manifest, specs, signature, deferred
 
 
+def _pack_gemini_recovery_prompt(
+    request: dict[str, Any],
+    prepared_input: Any,
+) -> tuple[
+    str,
+    str,
+    dict[str, dict[str, Any]],
+    str,
+    set[str],
+    str,
+]:
+    """Build a bounded fresh-conversation checkpoint after resume loss."""
+    budgets: list[int] = []
+    budget = MAX_GEMINI_RECOVERY_DELTA_BYTES
+    while budget >= 3_000:
+        budgets.append(budget)
+        budget //= 2
+    last_error: PromptBudgetError | None = None
+    last_delta = ""
+    for recovery_budget in budgets:
+        delta = _bounded_recovery_delta(prepared_input, recovery_budget)
+        if delta == last_delta:
+            continue
+        last_delta = delta
+        try:
+            packed = _pack_gemini_prompt(
+                request,
+                delta,
+                include_contract=True,
+                include_instructions=True,
+                include_tools=True,
+                deferred_tools=set(),
+            )
+            return (*packed, delta)
+        except PromptBudgetError as error:
+            last_error = error
+    if last_error is not None:
+        raise last_error
+    raise PromptBudgetError("Gemini recovery checkpoint could not be built")
+
+
 def _repair_prompt(error: str, tool_specs: dict[str, dict[str, Any]]) -> str:
     available = sorted(tool_specs)
     if "mcp__node_repl__js" in tool_specs:
@@ -1660,22 +1811,16 @@ def _tool_inspection_prompt(
 
 
 class AgyWorker:
-    def __init__(self, key: str):
+    def __init__(self, key: str, state: AgySessionState | None = None):
         self.key = key
+        self.state = state or AgySessionState(key)
+        if self.state.key != key:
+            raise ValueError("Antigravity session key does not match worker key")
         self.lock = threading.Lock()
         self.process: subprocess.Popen[str] | None = None
         self.events: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self.reader: threading.Thread | None = None
-        self.seen: set[str] = set()
-        self.seeded = False
-        self.instructions_signature: str | None = None
-        self.tool_signature: str | None = None
-        self.tool_definition_hashes: dict[str, str] = {}
-        self.deferred_tool_names: set[str] = set()
-        self.attachment_dir = Path(tempfile.mkdtemp(
-            prefix="codex-gemini-images-"
-        ))
-        self.last_used = time.monotonic()
+        self.last_start_resumed = False
 
     def _stop_process(self) -> None:
         process = self.process
@@ -1691,25 +1836,59 @@ class AgyWorker:
 
     def close(self) -> None:
         self._stop_process()
-        shutil.rmtree(self.attachment_dir, ignore_errors=True)
 
-    def _start(self) -> None:
+    @staticmethod
+    def _conversation_id_from_init(event: dict[str, Any]) -> str:
+        conversation_id = event.get("conversation_id")
+        if (
+            not isinstance(conversation_id, str)
+            or re.fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-"
+                r"[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                conversation_id,
+                re.IGNORECASE,
+            ) is None
+        ):
+            raise AgyProcessError("Antigravity returned an invalid conversation ID")
+        return conversation_id
+
+    def _await_init(self) -> str:
+        deadline = time.monotonic() + AGY_INIT_TIMEOUT_SECONDS
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise AgyProcessError("Antigravity planner initialization timed out")
+            try:
+                event = self.events.get(timeout=remaining)
+            except queue.Empty as error:
+                raise AgyProcessError(
+                    "Antigravity planner initialization timed out"
+                ) from error
+            if event is None:
+                raise AgyProcessError(
+                    "Antigravity planner closed during initialization"
+                )
+            if event.get("event") == "init":
+                return self._conversation_id_from_init(event)
+
+    def _start(self, resume: bool | None = None) -> bool:
         self._stop_process()
-        self.attachment_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.state.attachment_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.events = queue.Queue()
-        self.seen.clear()
-        self.seeded = False
-        self.instructions_signature = None
-        self.tool_signature = None
-        self.tool_definition_hashes = {}
-        self.deferred_tool_names = set()
+        resume_id = self.state.conversation_id if resume is not False else None
+        if resume is True and resume_id is None:
+            raise AgyResumeError("Antigravity conversation ID is unavailable")
+        if resume_id is None:
+            self.state.reset_conversation()
         command = [
             str(AGY), "--model", MODEL, "--effort", "low", "--sandbox",
-            "--add-dir", str(self.attachment_dir),
+            "--add-dir", str(self.state.attachment_dir),
             "--disable-slash-commands", "--json-schema", str(SCHEMA),
             "--input-format", "stream-json", "--output-format", "stream-json",
             "--print-timeout", "90s",
         ]
+        if resume_id is not None:
+            command[1:1] = ["--conversation", resume_id]
         self.process = subprocess.Popen(
             command,
             stdin=subprocess.PIPE,
@@ -1725,6 +1904,19 @@ class AgyWorker:
             daemon=True,
         )
         self.reader.start()
+        try:
+            actual_id = self._await_init()
+        except Exception:
+            self._stop_process()
+            raise
+        if resume_id is not None and actual_id != resume_id:
+            self._stop_process()
+            raise AgyResumeError(
+                "Antigravity native conversation could not be resumed"
+            )
+        self.state.conversation_id = actual_id
+        self.last_start_resumed = resume_id is not None
+        return self.last_start_resumed
 
     @staticmethod
     def _read_events(
@@ -1835,60 +2027,93 @@ class AgyWorker:
         on_text_delta: Callable[[str], None] | None = None,
     ) -> tuple[dict[str, Any], dict[str, int]]:
         with self.lock:
+            recovery_reseed = False
             if self.process is None or self.process.poll() is not None:
-                self._start()
+                try:
+                    self._start()
+                except AgyResumeError:
+                    self._start(resume=False)
+                    recovery_reseed = True
             _, _, incoming_tool_signature = _flatten_tool_catalog(
                 request.get("tools"),
                 request.get("tool_choice", "auto"),
                 bool(request.get("parallel_tool_calls", False)),
-                self.deferred_tool_names,
+                self.state.deferred_tool_names,
             )
             instructions = _request_instructions(request)
             instructions_signature = hashlib.sha256(instructions.encode()).hexdigest()
             prepared_input = _prepare_gemini_input(
                 request.get("input"),
-                self.attachment_dir,
+                self.state.attachment_dir,
             )
-            delta, fingerprints = _serialize_delta(prepared_input, self.seen)
+            delta, fingerprints = _serialize_delta(
+                prepared_input,
+                self.state.seen,
+            )
             if not delta:
                 delta = "Continue the latest pending task from the newest known state."
-            include_contract = not self.seeded
+            include_contract = not self.state.seeded
             include_instructions = (
-                not self.seeded
-                or instructions_signature != self.instructions_signature
+                not self.state.seeded
+                or instructions_signature != self.state.instructions_signature
             )
             include_tools = (
-                not self.seeded
-                or incoming_tool_signature != self.tool_signature
+                not self.state.seeded
+                or incoming_tool_signature != self.state.tool_signature
             )
             starting_deferred = (
                 set()
-                if include_tools and incoming_tool_signature != self.tool_signature
-                else self.deferred_tool_names
+                if include_tools
+                and incoming_tool_signature != self.state.tool_signature
+                else self.state.deferred_tool_names
             )
-            (
-                prompt,
-                tool_manifest,
-                tool_specs,
-                tool_signature,
-                packed_deferred_tools,
-            ) = _pack_gemini_prompt(
-                request,
-                delta,
-                include_contract=include_contract,
-                include_instructions=include_instructions,
-                include_tools=include_tools,
-                deferred_tools=starting_deferred,
-            )
+            if recovery_reseed:
+                (
+                    prompt,
+                    tool_manifest,
+                    tool_specs,
+                    tool_signature,
+                    packed_deferred_tools,
+                    delta,
+                ) = _pack_gemini_recovery_prompt(request, prepared_input)
+            else:
+                try:
+                    (
+                        prompt,
+                        tool_manifest,
+                        tool_specs,
+                        tool_signature,
+                        packed_deferred_tools,
+                    ) = _pack_gemini_prompt(
+                        request,
+                        delta,
+                        include_contract=include_contract,
+                        include_instructions=include_instructions,
+                        include_tools=include_tools,
+                        deferred_tools=starting_deferred,
+                    )
+                except PromptBudgetError:
+                    if self.state.seeded:
+                        raise
+                    (
+                        prompt,
+                        tool_manifest,
+                        tool_specs,
+                        tool_signature,
+                        packed_deferred_tools,
+                        delta,
+                    ) = _pack_gemini_recovery_prompt(request, prepared_input)
+                    recovery_reseed = True
             tool_definition_hashes = {
                 name: hashlib.sha256(_json(spec["definition"]).encode()).hexdigest()
                 for name, spec in tool_specs.items()
             }
             changed_tool_names = sorted(
                 name
-                for name in set(tool_definition_hashes) | set(self.tool_definition_hashes)
+                for name in set(tool_definition_hashes)
+                | set(self.state.tool_definition_hashes)
                 if tool_definition_hashes.get(name)
-                != self.tool_definition_hashes.get(name)
+                != self.state.tool_definition_hashes.get(name)
             )
             if DEBUG_TOOLS:
                 print(_json({
@@ -1903,6 +2128,10 @@ class AgyWorker:
                     "tool_names": sorted(tool_specs),
                     "changed_tool_names": changed_tool_names,
                     "budget_deferred_tools": sorted(packed_deferred_tools),
+                    "native_conversation": (
+                        self.state.conversation_id or ""
+                    )[:12],
+                    "recovery_reseed": recovery_reseed,
                 }), file=sys.stderr, flush=True)
             started = time.monotonic()
             last_error = "invalid planner result"
@@ -1939,21 +2168,27 @@ class AgyWorker:
                         ),
                         inspected_tools=inspected_tools,
                     )
-                    new_item_count = len(fingerprints - self.seen)
-                    self.seen.update(fingerprints)
-                    self.seeded = True
-                    self.instructions_signature = instructions_signature
-                    self.tool_signature = tool_signature
-                    self.tool_definition_hashes = tool_definition_hashes
-                    self.deferred_tool_names = set(packed_deferred_tools)
-                    self.last_used = time.monotonic()
+                    new_item_count = len(fingerprints - self.state.seen)
+                    self.state.seen.update(fingerprints)
+                    self.state.seeded = True
+                    self.state.instructions_signature = instructions_signature
+                    self.state.tool_signature = tool_signature
+                    self.state.tool_definition_hashes = tool_definition_hashes
+                    self.state.deferred_tool_names = set(packed_deferred_tools)
+                    self.state.last_used = time.monotonic()
                     print(_json({
                         "event": "gemini_turn",
                         "session": self.key[:12],
-                        "planner_ms": round((self.last_used - started) * 1000),
+                        "planner_ms": round(
+                            (self.state.last_used - started) * 1000
+                        ),
                         "new_items": new_item_count,
                         "attempt": attempt + 1,
                         "tool_count": len(tool_specs),
+                        "native_conversation": (
+                            self.state.conversation_id or ""
+                        )[:12],
+                        "recovery_reseed": recovery_reseed,
                     }), file=sys.stderr, flush=True)
                     return proposal, usage
                 except (RuntimeError, TimeoutError, ValueError, BrokenPipeError) as error:
@@ -1970,23 +2205,28 @@ class AgyWorker:
                         (AgyProcessError, TimeoutError, BrokenPipeError),
                     ) or process is None or process.poll() is not None
                     if restart_required:
-                        self._start()
                         inspected_tools.clear()
-                        full_state = _serialize_input(prepared_input)
-                        (
-                            next_prompt,
-                            tool_manifest,
-                            tool_specs,
-                            tool_signature,
-                            packed_deferred_tools,
-                        ) = _pack_gemini_prompt(
-                            request,
-                            full_state,
-                            include_contract=True,
-                            include_instructions=True,
-                            include_tools=True,
-                            deferred_tools=set(),
-                        )
+                        try:
+                            resumed = self._start()
+                        except AgyResumeError:
+                            self._start(resume=False)
+                            resumed = False
+                        if resumed:
+                            next_prompt = prompt
+                        else:
+                            (
+                                next_prompt,
+                                tool_manifest,
+                                tool_specs,
+                                tool_signature,
+                                packed_deferred_tools,
+                                delta,
+                            ) = _pack_gemini_recovery_prompt(
+                                request,
+                                prepared_input,
+                            )
+                            prompt = next_prompt
+                            recovery_reseed = True
                     else:
                         next_prompt = _repair_prompt(last_error, tool_specs)
             raise RuntimeError(f"Antigravity failed after three attempts: {last_error}")
@@ -2128,29 +2368,61 @@ class WorkerPool:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.workers: dict[str, AgyWorker] = {}
+        self.sessions: dict[str, AgySessionState] = {}
+
+    def _session_for(self, key: str) -> AgySessionState:
+        state = self.sessions.get(key)
+        if state is not None:
+            return state
+        if len(self.sessions) >= MAX_AGY_SESSION_STATES:
+            inactive = [
+                name for name in self.sessions
+                if name not in self.workers
+            ]
+            if inactive:
+                oldest = min(
+                    inactive,
+                    key=lambda name: self.sessions[name].last_used,
+                )
+                self.sessions.pop(oldest).dispose()
+        state = AgySessionState(key)
+        self.sessions[key] = state
+        return state
 
     def get(self, key: str) -> AgyWorker:
         with self.lock:
             now = time.monotonic()
             expired = [
                 name for name, worker in self.workers.items()
-                if now - worker.last_used > WORKER_IDLE_SECONDS and not worker.lock.locked()
+                if now - worker.state.last_used > WORKER_IDLE_SECONDS
+                and not worker.lock.locked()
             ]
             for name in expired:
                 self.workers.pop(name).close()
             if key not in self.workers and len(self.workers) >= MAX_WORKERS:
                 idle = [name for name, worker in self.workers.items() if not worker.lock.locked()]
                 if idle:
-                    oldest = min(idle, key=lambda name: self.workers[name].last_used)
+                    oldest = min(
+                        idle,
+                        key=lambda name: self.workers[name].state.last_used,
+                    )
                     self.workers.pop(oldest).close()
-            return self.workers.setdefault(key, AgyWorker(key))
+            worker = self.workers.get(key)
+            if worker is None:
+                worker = AgyWorker(key, self._session_for(key))
+                self.workers[key] = worker
+            return worker
 
     def close(self) -> None:
         with self.lock:
             workers = list(self.workers.values())
             self.workers.clear()
+            sessions = list(self.sessions.values())
+            self.sessions.clear()
         for worker in workers:
             worker.close()
+        for state in sessions:
+            state.dispose()
 
 
 WORKERS = WorkerPool()
