@@ -13,6 +13,14 @@
         {
           "effort": "low",
           "description": "Fast Gemini 3.8 Flash planning"
+        },
+        {
+          "effort": "medium",
+          "description": "Balanced Gemini 3.8 Flash planning"
+        },
+        {
+          "effort": "high",
+          "description": "Thorough Gemini 3.8 Flash planning"
         }
       ],
       "shell_type": "unified_exec",

@@ -1250,6 +1250,75 @@ class AntigravityConversationLifecycleTests(unittest.TestCase):
             self.CONVERSATION_ID,
         )
 
+    def test_medium_effort_command_and_effort_change_resume(self) -> None:
+        worker = proxy.AgyWorker("effort-change")
+        process = mock.Mock()
+        process.poll.return_value = None
+        reader = mock.Mock()
+        worker._turn = mock.Mock(return_value=({
+            "kind": "message",
+            "content": "Done.",
+            "name": "",
+            "arguments_json": "{}",
+        }, {}))
+        request = self.request([self.message("Use more reasoning.")])
+        request["reasoning"] = {"effort": "medium"}
+        with (
+            mock.patch.object(proxy.subprocess, "Popen", return_value=process) as popen,
+            mock.patch.object(worker, "_await_init", return_value=self.CONVERSATION_ID),
+            mock.patch.object(proxy.threading, "Thread", return_value=reader),
+            mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"),
+        ):
+            worker.call(request)
+        command = popen.call_args.args[0]
+        self.assertIn("gemini-3.8-flash-medium", command)
+        self.assertEqual(command[command.index("--effort") + 1], "medium")
+
+        worker._start = mock.Mock(return_value=True)
+        request["reasoning"] = {"effort": "high"}
+        with mock.patch.object(proxy, "_load_computer_use_skill", return_value="CU"):
+            worker.call(request)
+        worker._start.assert_called_once_with(resume=True)
+
+    def test_pool_adopts_and_replaces_spare_but_not_for_resume(self) -> None:
+        processes: list[mock.Mock] = []
+
+        def start(worker: proxy.AgyWorker, resume: bool = False) -> bool:
+            process = mock.Mock()
+            process.poll.return_value = None
+            worker.process = process
+            worker.state.conversation_id = self.CONVERSATION_ID
+            processes.append(process)
+            return False
+
+        with (
+            mock.patch.object(proxy.WorkerPool, "_start_prewarm") as prewarm,
+            mock.patch.object(proxy.AgyWorker, "_start", autospec=True, side_effect=start),
+            mock.patch.object(proxy.AgyWorker, "close"),
+        ):
+            pool = proxy.WorkerPool()
+            try:
+                pool._prewarm()
+                first_spare = pool.spare
+                self.assertIsNotNone(first_spare)
+                assert first_spare is not None
+                adopted = pool.get("new-thread")
+                self.assertIs(adopted, first_spare)
+                self.assertIs(adopted.process, processes[0])
+                prewarm.assert_called()
+
+                pool._prewarm()
+                self.assertIsNotNone(pool.spare)
+                self.assertIsNot(pool.spare, first_spare)
+                saved = pool._session_for("saved-thread")
+                saved.conversation_id = self.CONVERSATION_ID
+                replacement_spare = pool.spare
+                resumed = pool.get("saved-thread")
+                self.assertIsNot(resumed, replacement_spare)
+                self.assertIs(pool.spare, replacement_spare)
+            finally:
+                pool.close()
+
     def test_init_rejects_invalid_or_changed_conversation_id(self) -> None:
         with self.assertRaisesRegex(proxy.AgyProcessError, "invalid"):
             proxy.AgyWorker._conversation_id_from_init({

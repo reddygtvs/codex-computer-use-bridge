@@ -12,6 +12,7 @@ import base64
 import binascii
 import certifi
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import http.client
@@ -32,7 +33,7 @@ import uuid
 
 
 GEMINI_MODEL = "gemini-3.7-flash-low"
-AGY_MODEL = "gemini-3.8-flash-low"
+AGY_MODEL_PREFIX = "gemini-3.8-flash"
 SOL_NONE_MODEL = "gpt-5.6-sol-none"
 SOL_FAST_MODEL = "gpt-5.6-sol-fast"
 MODEL = GEMINI_MODEL
@@ -60,7 +61,7 @@ COMPUTER_USE_SKILL_ROOT = (
     Path.home() / ".codex/plugins/cache/openai-bundled/computer-use"
 )
 DEBUG_TOOLS = False
-WORKER_IDLE_SECONDS = 15 * 60
+WORKER_IDLE_SECONDS = 60 * 60
 MAX_WORKERS = 8
 MAX_AGY_SESSION_STATES = 256
 MAX_COMPUTER_ACTIONS = 64
@@ -184,6 +185,23 @@ KEY_ALIASES = {
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def _log(event: dict[str, Any]) -> None:
+    print(_json({
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **event,
+    }), file=sys.stderr, flush=True)
+
+
+def _reasoning_effort(request: dict[str, Any]) -> str:
+    reasoning = request.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    if effort in ("medium", "high"):
+        return effort
+    if effort in ("xhigh", "max", "ultra"):
+        return "high"
+    return "low"
 
 
 def _utf8_size(value: str) -> int:
@@ -1819,7 +1837,12 @@ def _tool_inspection_prompt(
 
 
 class AgyWorker:
-    def __init__(self, key: str, state: AgySessionState | None = None):
+    def __init__(
+        self,
+        key: str,
+        state: AgySessionState | None = None,
+        effort: str = "low",
+    ):
         self.key = key
         self.state = state or AgySessionState(key)
         if self.state.key != key:
@@ -1829,6 +1852,7 @@ class AgyWorker:
         self.events: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self.reader: threading.Thread | None = None
         self.last_start_resumed = False
+        self.effort = effort
 
     def _stop_process(self) -> None:
         process = self.process
@@ -1889,7 +1913,8 @@ class AgyWorker:
         if resume_id is None:
             self.state.reset_conversation()
         command = [
-            str(AGY), "--model", AGY_MODEL, "--effort", "low", "--sandbox",
+            str(AGY), "--model", f"{AGY_MODEL_PREFIX}-{self.effort}",
+            "--effort", self.effort, "--sandbox",
             "--add-dir", str(self.state.attachment_dir),
             "--disable-slash-commands", "--json-schema", str(SCHEMA),
             "--input-format", "stream-json", "--output-format", "stream-json",
@@ -2036,6 +2061,20 @@ class AgyWorker:
     ) -> tuple[dict[str, Any], dict[str, int]]:
         with self.lock:
             recovery_reseed = False
+            requested_effort = _reasoning_effort(request)
+            if (
+                requested_effort != self.effort
+                and self.process is not None
+                and self.process.poll() is None
+            ):
+                self.effort = requested_effort
+                try:
+                    self._start(resume=True)
+                except AgyResumeError:
+                    self._start(resume=False)
+                    recovery_reseed = True
+            else:
+                self.effort = requested_effort
             if self.process is None or self.process.poll() is not None:
                 try:
                     self._start()
@@ -2124,7 +2163,7 @@ class AgyWorker:
                 != self.state.tool_definition_hashes.get(name)
             )
             if DEBUG_TOOLS:
-                print(_json({
+                _log({
                     "event": "gemini_prompt_debug",
                     "session": self.key[:12],
                     "prompt_chars": len(prompt),
@@ -2140,7 +2179,7 @@ class AgyWorker:
                         self.state.conversation_id or ""
                     )[:12],
                     "recovery_reseed": recovery_reseed,
-                }), file=sys.stderr, flush=True)
+                })
             started = time.monotonic()
             last_error = "invalid planner result"
             next_prompt = prompt
@@ -2184,7 +2223,7 @@ class AgyWorker:
                     self.state.tool_definition_hashes = tool_definition_hashes
                     self.state.deferred_tool_names = set(packed_deferred_tools)
                     self.state.last_used = time.monotonic()
-                    print(_json({
+                    _log({
                         "event": "gemini_turn",
                         "session": self.key[:12],
                         "planner_ms": round(
@@ -2197,16 +2236,16 @@ class AgyWorker:
                             self.state.conversation_id or ""
                         )[:12],
                         "recovery_reseed": recovery_reseed,
-                    }), file=sys.stderr, flush=True)
+                    })
                     return proposal, usage
                 except (RuntimeError, TimeoutError, ValueError, BrokenPipeError) as error:
                     last_error = str(error)
-                    print(_json({
+                    _log({
                         "event": "gemini_retry",
                         "session": self.key[:12],
                         "attempt": attempt + 1,
                         "error": last_error[:1000],
-                    }), file=sys.stderr, flush=True)
+                    })
                     process = self.process
                     restart_required = isinstance(
                         error,
@@ -2320,7 +2359,7 @@ class OpenAIPlannerWorker:
             self.last_used = time.monotonic()
             usage = _api_usage(response)
             config = API_PLANNER_MODELS[self.picker_model]
-            print(_json({
+            _log({
                 "event": "openai_api_turn",
                 "session": self.key[:12],
                 "picker_model": self.picker_model,
@@ -2328,7 +2367,7 @@ class OpenAIPlannerWorker:
                 "planner_ms": round((self.last_used - started) * 1000),
                 "service_tier": response.get("service_tier"),
                 **usage,
-            }), file=sys.stderr, flush=True)
+            })
             return proposal, usage
 
 
@@ -2377,6 +2416,39 @@ class WorkerPool:
         self.lock = threading.Lock()
         self.workers: dict[str, AgyWorker] = {}
         self.sessions: dict[str, AgySessionState] = {}
+        self.spare: AgyWorker | None = None
+        self.prewarming = False
+        self.closed = False
+
+    def _start_prewarm(self) -> None:
+        if self.closed or self.prewarming:
+            return
+        self.prewarming = True
+        threading.Thread(target=self._prewarm, daemon=True).start()
+
+    def _prewarm(self) -> None:
+        state = AgySessionState("__prewarm__" + uuid.uuid4().hex)
+        worker = AgyWorker(state.key, state)
+        try:
+            worker._start(resume=False)
+        except Exception:
+            worker.close()
+            state.dispose()
+            with self.lock:
+                self.prewarming = False
+            return
+        with self.lock:
+            self.prewarming = False
+            if self.closed or self.spare is not None:
+                keep = False
+            else:
+                self.spare = worker
+                keep = True
+        if keep:
+            _log({"event": "agy_prewarm_ready"})
+        else:
+            worker.close()
+            state.dispose()
 
     def _session_for(self, key: str) -> AgySessionState:
         state = self.sessions.get(key)
@@ -2397,7 +2469,7 @@ class WorkerPool:
         self.sessions[key] = state
         return state
 
-    def get(self, key: str) -> AgyWorker:
+    def get(self, key: str, effort: str = "low") -> AgyWorker:
         with self.lock:
             now = time.monotonic()
             expired = [
@@ -2417,18 +2489,44 @@ class WorkerPool:
                     self.workers.pop(oldest).close()
             worker = self.workers.get(key)
             if worker is None:
-                worker = AgyWorker(key, self._session_for(key))
+                spare = self.spare
+                if (
+                    effort == "low"
+                    and key not in self.sessions
+                    and spare is not None
+                    and spare.process is not None
+                    and spare.process.poll() is None
+                ):
+                    self.spare = None
+                    spare.key = key
+                    spare.state.key = key
+                    spare.state.last_used = time.monotonic()
+                    self.sessions[key] = spare.state
+                    worker = spare
+                    _log({
+                        "event": "agy_prewarm_adopted",
+                        "session": key[:12],
+                    })
+                    self._start_prewarm()
+                else:
+                    worker = AgyWorker(key, self._session_for(key), effort)
                 self.workers[key] = worker
             return worker
 
     def close(self) -> None:
         with self.lock:
+            self.closed = True
             workers = list(self.workers.values())
             self.workers.clear()
+            spare = self.spare
+            self.spare = None
             sessions = list(self.sessions.values())
             self.sessions.clear()
         for worker in workers:
             worker.close()
+        if spare is not None:
+            spare.close()
+            spare.state.dispose()
         for state in sessions:
             state.dispose()
 
@@ -2762,6 +2860,38 @@ def _sse_events(
     return events
 
 
+def _request_upstream(
+    host: str,
+    path: str,
+    body: bytes,
+    headers: dict[str, str],
+    tls: ssl.SSLContext,
+) -> tuple[http.client.HTTPSConnection, http.client.HTTPResponse]:
+    retry_errors = (
+        ssl.SSLError,
+        ConnectionResetError,
+        http.client.RemoteDisconnected,
+    )
+    for attempt in range(2):
+        connection = http.client.HTTPSConnection(
+            host,
+            timeout=180,
+            context=tls,
+        )
+        try:
+            connection.request("POST", path, body=body, headers=headers)
+            return connection, connection.getresponse()
+        except retry_errors as error:
+            connection.close()
+            if attempt:
+                raise
+            _log({
+                "event": "upstream_retry",
+                "error": f"{type(error).__name__}: {error}",
+            })
+    raise RuntimeError("upstream request retry failed")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "AntigravityCodex/0.2"
 
@@ -2810,13 +2940,29 @@ class Handler(BaseHTTPRequestHandler):
             if model not in CUSTOM_MODELS:
                 self._forward_openai(body)
                 return
+        except (BrokenPipeError, ConnectionResetError):
+            _log({"event": "client_disconnected"})
+            return
         except Exception as error:
-            print(f"adapter error: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
-            self._send_json(500, {"error": {"message": str(error), "type": "adapter_error"}})
+            _log({
+                "event": "adapter_error",
+                "error": f"{type(error).__name__}: {error}",
+            })
+            try:
+                self._send_json(500, {
+                    "error": {"message": str(error), "type": "adapter_error"},
+                })
+            except (BrokenPipeError, ConnectionResetError):
+                pass
 
     def _write_sse(self, event: dict[str, Any]) -> None:
-        self.wfile.write(f"event: {event['type']}\ndata: {_json(event)}\n\n".encode())
-        self.wfile.flush()
+        try:
+            self.wfile.write(
+                f"event: {event['type']}\ndata: {_json(event)}\n\n".encode()
+            )
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            raise
 
     def _serve_custom(
         self,
@@ -2841,7 +2987,10 @@ class Handler(BaseHTTPRequestHandler):
         })
         try:
             key = _planner_key(self.headers, request)
-            worker = workers.get(key)
+            if isinstance(workers, WorkerPool):
+                worker = workers.get(key, _reasoning_effort(request))
+            else:
+                worker = workers.get(key)
             streamed_message_id: str | None = None
             streamed_text = ""
 
@@ -2898,12 +3047,12 @@ class Handler(BaseHTTPRequestHandler):
                 if final_text.startswith(streamed_text):
                     stream_text(final_text[len(streamed_text):])
                 elif streamed_text.rstrip() != final_text.rstrip():
-                    print(_json({
+                    _log({
                         "event": "gemini_stream_mismatch",
                         "session": key[:12],
                         "streamed_chars": len(streamed_text),
                         "final_chars": len(final_text),
-                    }), file=sys.stderr, flush=True)
+                    })
             for event in _sse_events(
                 proposal,
                 usage,
@@ -2914,8 +3063,13 @@ class Handler(BaseHTTPRequestHandler):
                 streamed_message_text=streamed_text,
             ):
                 self._write_sse(event)
+        except (BrokenPipeError, ConnectionResetError):
+            raise
         except Exception as error:
-            print(f"adapter error: {type(error).__name__}: {error}", file=sys.stderr, flush=True)
+            _log({
+                "event": "adapter_error",
+                "error": f"{type(error).__name__}: {error}",
+            })
             failed = _base_response(
                 response_id,
                 "failed",
@@ -2952,19 +3106,14 @@ class Handler(BaseHTTPRequestHandler):
             if value:
                 headers[name] = value
         tls = ssl.create_default_context(cafile=certifi.where())
-        connection = http.client.HTTPSConnection(
+        connection, upstream = _request_upstream(
             CODEX_SUBSCRIPTION_HOST,
-            timeout=180,
-            context=tls,
+            CODEX_SUBSCRIPTION_PATH,
+            body,
+            headers,
+            tls,
         )
         try:
-            connection.request(
-                "POST",
-                CODEX_SUBSCRIPTION_PATH,
-                body=body,
-                headers=headers,
-            )
-            upstream = connection.getresponse()
             self.send_response(upstream.status)
             self.send_header("Content-Type", upstream.getheader("Content-Type", "text/event-stream"))
             self.send_header("Cache-Control", "no-cache")
@@ -3001,19 +3150,14 @@ class Handler(BaseHTTPRequestHandler):
             ),
         }
         tls = ssl.create_default_context(cafile=certifi.where())
-        connection = http.client.HTTPSConnection(
+        connection, upstream = _request_upstream(
             OPENAI_API_HOST,
-            timeout=180,
-            context=tls,
+            OPENAI_API_PATH,
+            _json(payload).encode(),
+            headers,
+            tls,
         )
         try:
-            connection.request(
-                "POST",
-                OPENAI_API_PATH,
-                body=_json(payload).encode(),
-                headers=headers,
-            )
-            upstream = connection.getresponse()
             self.send_response(upstream.status)
             self.send_header(
                 "Content-Type",
@@ -3042,7 +3186,22 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+            self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            raise
+
+
+class QuietServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        error = sys.exc_info()[1]
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            _log({"event": "client_disconnected"})
+            return
+        super().handle_error(request, client_address)
 
 
 def main() -> int:
@@ -3055,7 +3214,15 @@ def main() -> int:
     DEBUG_TOOLS = args.debug_tools
     if not AGY.is_file():
         parser.error(f"Antigravity CLI was not found at {AGY}")
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    log_path = Path(os.environ.get(
+        "CODEX_ROUTER_LOG", "~/Library/Logs/codex-antigravity-router.log"
+    )).expanduser()
+    if log_path.is_file() and log_path.stat().st_size > 5 * 1024 * 1024:
+        rotated = Path(str(log_path) + ".1")
+        rotated.unlink(missing_ok=True)
+        log_path.replace(rotated)
+    WORKERS._start_prewarm()
+    server = QuietServer((args.host, args.port), Handler)
     print(
         _json(
             {
