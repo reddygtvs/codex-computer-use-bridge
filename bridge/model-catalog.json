@@ -5,14 +5,14 @@
   "models": [
     {
       "slug": "gemini-3.7-flash-low",
-      "display_name": "Gemini 3.7 Flash",
+      "display_name": "Gemini 3.8 Flash",
       "description": "Antigravity subscription model with native Codex tools and Computer Use.",
-      "base_instructions": "You are Codex running with Gemini 3.7 Flash. Work with the user in the shared workspace. Use only the tools supplied by Codex. Follow all developer instructions, skills, permission rules, and confirmation requirements. Continue until the user task is complete, then give a concise final answer.",
+      "base_instructions": "You are Codex running with Gemini 3.8 Flash. Work with the user in the shared workspace. Use only the tools supplied by Codex. Follow all developer instructions, skills, permission rules, and confirmation requirements. Continue until the user task is complete, then give a concise final answer.",
       "default_reasoning_level": "low",
       "supported_reasoning_levels": [
         {
           "effort": "low",
-          "description": "Fast Gemini 3.7 Flash planning"
+          "description": "Fast Gemini 3.8 Flash planning"
         }
       ],
       "shell_type": "unified_exec",

@@ -32,6 +32,7 @@ import uuid
 
 
 GEMINI_MODEL = "gemini-3.7-flash-low"
+AGY_MODEL = "gemini-3.8-flash-low"
 SOL_NONE_MODEL = "gpt-5.6-sol-none"
 SOL_FAST_MODEL = "gpt-5.6-sol-fast"
 MODEL = GEMINI_MODEL
@@ -336,7 +337,14 @@ def _item_fingerprint(item: Any) -> str:
 
 
 def _load_computer_use_skill() -> str:
-    candidates = list(COMPUTER_USE_SKILL_ROOT.glob("*/skills/computer-use/SKILL.md"))
+    candidates = [
+        *COMPUTER_USE_SKILL_ROOT.glob("*/skills/computer-use/SKILL.md"),
+        *COMPUTER_USE_SKILL_ROOT.glob("*/.codex-plugin/computer-use-node-repl.md"),
+        *Path.home().glob(
+            ".codex/.tmp/bundled-marketplaces/openai-bundled/plugins/computer-use/skills/computer-use/SKILL.md"
+        ),
+    ]
+    candidates = [path for path in candidates if path.is_file()]
     if not candidates:
         raise RuntimeError("Computer Use skill could not be found")
     skill = max(candidates, key=lambda path: path.stat().st_mtime)
@@ -1881,7 +1889,7 @@ class AgyWorker:
         if resume_id is None:
             self.state.reset_conversation()
         command = [
-            str(AGY), "--model", MODEL, "--effort", "low", "--sandbox",
+            str(AGY), "--model", AGY_MODEL, "--effort", "low", "--sandbox",
             "--add-dir", str(self.state.attachment_dir),
             "--disable-slash-commands", "--json-schema", str(SCHEMA),
             "--input-format", "stream-json", "--output-format", "stream-json",
